@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>สวนอัจฉริยะ — จัดการสวนผลไม้</title>
+<meta name="description" content="แอปจัดการและวิเคราะห์ต้นทุนสวนผลไม้ ใช้งานได้แบบออฟไลน์">
+<meta name="theme-color" content="#2F6BFF">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+
+<!-- ===== ไอคอนแอป (ตอนเพิ่มไปหน้าจอโฮม) ===== -->
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="apple-touch-icon" sizes="180x180" href="icons/icon-180.png">
+<link rel="icon" type="image/png" sizes="32x32" href="icons/icon-32.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="icon" href="icons/favicon.ico" sizes="any">
+<link rel="manifest" href="manifest.json">
+
+<!-- ชื่อและพฤติกรรมตอนเปิดจากหน้าจอโฮม -->
+<meta name="apple-mobile-web-app-title" content="สวนอัจฉริยะ">
+<meta name="application-name" content="สวนอัจฉริยะ">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <div class="topbar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <div style="min-width:0">
+        <h1 id="gardenNameTop">สวนอัจฉริยะ</h1>
+        <div class="sub" id="gardenMetaTop"></div>
+      </div>
+    </div>
+    <div style="display:flex; align-items:center; gap:8px">
+      <span class="sync-dot" id="syncDot" style="display:none" title="สถานะการซิงก์"></span>
+      <button class="icon-btn dark" id="topMenuBtn" aria-label="เมนู">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <main>
+    <section id="view-dashboard" class="view active"></section>
+    <section id="view-plots" class="view"></section>
+    <section id="view-plotDetail" class="view"></section>
+    <section id="view-calendar" class="view"></section>
+    <section id="view-analysis" class="view"></section>
+    <section id="view-menu" class="view"></section>
+    <section id="view-buyers" class="view"></section>
+    <section id="view-weather" class="view"></section>
+    <section id="view-settings" class="view"></section>
+  </main>
+
+  <nav class="bottom-nav">
+    <button class="nav-btn active" data-view="dashboard">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.5 12 4l9 7.5"/><path d="M5 10v9a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1v-9"/></svg>
+      หน้าแรก
+    </button>
+    <button class="nav-btn" data-view="plots">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3c3 2 5 5 5 8.5A5 5 0 0 1 7 11.5C7 8 9 5 12 3Z"/><path d="M12 13v8"/></svg>
+      แปลง
+    </button>
+
+    <button class="fab" id="fabAdd" aria-label="เพิ่มบันทึกใหม่">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+    </button>
+
+    <button class="nav-btn" data-view="calendar">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="4"/><path d="M8 3v4M16 3v4M3 10h18"/></svg>
+      ปฏิทิน
+    </button>
+    <button class="nav-btn" data-view="analysis">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M12 20V4M20 20v-7"/></svg>
+      วิเคราะห์
+    </button>
+  </nav>
+
+  <div class="overlay" id="overlay"></div>
+  <div class="sheet" id="sheetGeneric"></div>
+  <div class="sheet" id="sheetQuick"></div>
+  <div class="modal-full" id="wizardRoot"></div>
+  <div class="modal-full" id="modalMap"></div>
+  <div class="auth-screen" id="authRoot"></div>
+  <div class="cdlg-root" id="confirmRoot"></div>
+  <div class="toast" id="toast"></div>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>
