@@ -284,7 +284,17 @@ textarea{ resize: vertical; min-height: 72px; }
 .combo-list.open{ display:block; animation: fadeUp var(--dur-fast) var(--ease); }
 .combo-item{ padding:10px 12px; border-radius: var(--r-sm); font-size:14px; cursor:pointer; }
 .combo-item:hover, .combo-item.hi{ background: var(--blue-tint); }
-.combo-item.add-new{ color: var(--blue); font-weight:600; }
+.combo-item{ display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.combo-item.add-new{ color: var(--blue); font-weight:600; justify-content:flex-start; gap:8px; }
+.combo-item.add-new .add-plus{ font-size:15px; line-height:1; }
+.combo-meta{
+  font-size:11px; font-weight:600; color: var(--blue-deep);
+  background: var(--blue-tint); padding:2px 9px; border-radius: var(--r-pill); flex:none;
+}
+.combo-addhead{
+  font-size:11.5px; color: var(--text-soft); padding:9px 12px 5px;
+  border-top:1px solid var(--border); margin-top:4px;
+}
 
 /* ===================== Rows ===================== */
 .list{ display:flex; flex-direction:column; gap:10px; }
@@ -382,7 +392,11 @@ textarea{ resize: vertical; min-height: 72px; }
 .quick-item .qi-sub{ font-size:11.5px; color: var(--text-soft); margin-top:1px; }
 
 /* ===================== Wizard ===================== */
-.wizard{ min-height:100vh; display:flex; flex-direction:column; padding: 22px; }
+.wizard{
+  min-height:100vh; display:flex; flex-direction:column; padding: 22px;
+  /* keep the same column width as the app instead of stretching across a desktop screen */
+  max-width: 560px; margin: 0 auto;
+}
 .wizard-progress{ display:flex; gap:6px; margin-bottom:22px; }
 .wizard-progress .seg{ flex:1; height:5px; border-radius:99px; background: var(--border); transition: background var(--dur); }
 .wizard-progress .seg.done{ background: linear-gradient(90deg, var(--blue-soft), var(--blue)); }
@@ -425,12 +439,100 @@ textarea{ resize: vertical; min-height: 72px; }
 .item-row .field:last-of-type{ margin-bottom:0; }
 .line-total{ display:flex; align-items:center; justify-content:flex-end; font-size:12px; color: var(--text-soft); margin-top:8px; }
 .line-total b{ font-family: var(--font-mono); color: var(--text); margin-left:6px; font-size:13px; }
+/* ---- category colour coding ----
+   ปุ๋ย = blue, ยา = violet, อื่นๆ = slate. One hue per category, used
+   everywhere the category appears so it can be recognised without reading. */
+:root{
+  --cat-fertilizer:      #2F6BFF;
+  --cat-fertilizer-tint: #E7EEFF;
+  --cat-fertilizer-ink:  #1B4ED8;
+  --cat-pesticide:       #8B5CF6;
+  --cat-pesticide-tint:  #F0EAFE;
+  --cat-pesticide-ink:   #6B3FD4;
+  --cat-other:           #7A8AA8;
+  --cat-other-tint:      #EDF1F7;
+  --cat-other-ink:       #5A6A85;
+}
+.cat-tag{
+  display:inline-block; padding:3px 10px; border-radius: var(--r-pill);
+  font-size:11px; font-weight:700; margin-right:6px; flex:none;
+}
+.cat-tag:last-child{ margin-right:0; }
+.cat-tag.cat-fertilizer{ background: var(--cat-fertilizer-tint); color: var(--cat-fertilizer-ink); }
+.cat-tag.cat-pesticide{ background: var(--cat-pesticide-tint);  color: var(--cat-pesticide-ink); }
+.cat-tag.cat-other{     background: var(--cat-other-tint);      color: var(--cat-other-ink); }
+.cat-tag.cat-none{      background: var(--surface-alt); color: var(--text-faint); font-weight:600; }
+
+/* colour band down the left edge of a row */
+.cat-edge{ border-left:4px solid var(--border); }
+.cat-edge.cat-fertilizer{ border-left-color: var(--cat-fertilizer); }
+.cat-edge.cat-pesticide{  border-left-color: var(--cat-pesticide); }
+.cat-edge.cat-other{      border-left-color: var(--cat-other); }
+
+.cat-dot{ width:9px; height:9px; border-radius:50%; display:inline-block; flex:none; }
+.prod-head.cat-fertilizer{ color: var(--cat-fertilizer-ink); }
+.prod-head.cat-fertilizer .cat-dot{ background: var(--cat-fertilizer); }
+.prod-head.cat-pesticide{ color: var(--cat-pesticide-ink); }
+.prod-head.cat-pesticide .cat-dot{ background: var(--cat-pesticide); }
+.prod-head.cat-other{ color: var(--cat-other-ink); }
+.prod-head.cat-other .cat-dot{ background: var(--cat-other); }
+.prod-head .cnt{
+  background: var(--surface-alt); color: var(--text-soft);
+  padding:1px 8px; border-radius: var(--r-pill); font-size:11px;
+}
+.cat-tint-fertilizer{ background: var(--cat-fertilizer-tint); }
+.cat-tint-pesticide{  background: var(--cat-pesticide-tint); }
+
+.item-row .ir-right{ display:flex; align-items:center; gap:4px; }
+.item-row .ir-cat{ display:inline-flex; }
+
+/* grouped product registry in settings */
+.prod-group{ margin-bottom:14px; }
+.prod-group:last-child{ margin-bottom:0; }
+.prod-head{
+  font-size:12px; font-weight:700; color: var(--blue-deep);
+  margin:0 2px 7px; display:flex; align-items:center; gap:7px;
+}
+
+.mini-move{
+  border:none; background:none; color: var(--text-soft); cursor:pointer;
+  font-size:12px; padding:4px 6px;
+}
+
 .total-bar{
   display:flex; align-items:center; justify-content:space-between;
   background: var(--blue-tint); border-radius: var(--r-md); padding: 14px 16px; margin-bottom: 14px;
 }
 .total-bar .tb-l{ font-size:12.5px; color: var(--blue-deep); font-weight:600; }
 .total-bar .tb-v{ font-family: var(--font-mono); font-size:19px; font-weight:700; color: var(--blue-deep); }
+
+/* ===================== Analysis tables & insights ===================== */
+.tbl{ width:100%; border-collapse:collapse; font-size:13px; }
+.tbl th{
+  text-align:left; font-size:11px; font-weight:600; color: var(--text-faint);
+  padding:8px 14px; border-bottom:1px solid var(--border);
+}
+.tbl th.r, .tbl td.r{ text-align:right; }
+.tbl td{ padding:11px 14px; border-bottom:1px solid var(--border); vertical-align:middle; }
+.tbl tbody tr:last-child td{ border-bottom:none; }
+.tbl .t-name{ font-size:13.5px; font-weight:600; }
+.tbl .t-sub{ font-size:11px; color: var(--text-soft); margin-top:2px; }
+.pill{
+  display:inline-block; padding:4px 9px; border-radius: var(--r-pill);
+  font-size:12px; font-weight:700; font-family: var(--font-mono);
+}
+.pill.ok{ background: var(--blue-tint); color: var(--blue-deep); }
+.pill.bad{ background: var(--pink-tint); color: var(--pink-deep); }
+.pill.na{ background: var(--surface-alt); color: var(--text-faint); }
+
+.insight{
+  background: var(--blue-tint); border-radius: var(--r-md);
+  padding: 15px 17px; font-size:13px; color: var(--text); line-height:1.65;
+}
+.insight.bad{ background: var(--pink-tint); }
+.insight .ins-title{ font-weight:700; margin-bottom:6px; color: var(--blue-deep); }
+.insight.bad .ins-title{ color: var(--pink-deep); }
+.insight b{ font-family: var(--font-mono); }
 
 /* ===================== Login ===================== */
 .auth-screen{
