@@ -250,11 +250,23 @@ function mountCombo(container, opts){
     let matches = qq ? options.filter(o=>o.toLowerCase().includes(qq)) : options.slice(0,8);
     let html = "";
     matches.slice(0,8).forEach(m=>{
-      html += `<div class="combo-item" data-v="${escapeHtml(m)}">${escapeHtml(m)}</div>`;
+      // show which category an existing entry belongs to, so picking is unambiguous
+      const meta = opts.getOptionMeta ? opts.getOptionMeta(m) : '';
+      html += `<div class="combo-item" data-v="${escapeHtml(m)}">
+        <span>${escapeHtml(m)}</span>${meta||''}</div>`;
     });
     const exact = options.some(o=>o.toLowerCase()===qq);
     if(qq && !exact){
-      html += `<div class="combo-item add-new" data-v="${escapeHtml(q.trim())}">+ เพิ่ม "${escapeHtml(q.trim())}"</div>`;
+      if(opts.addOptions && opts.addOptions.length){
+        // adding something new asks what it is, right at the moment of adding
+        html += `<div class="combo-addhead">เพิ่ม "${escapeHtml(q.trim())}" เป็น...</div>`;
+        opts.addOptions.forEach(a=>{
+          html += `<div class="combo-item add-new" data-v="${escapeHtml(q.trim())}" data-add="${escapeHtml(a.key)}">
+            <span class="add-plus">+</span>${a.tag || escapeHtml(a.label)}</div>`;
+        });
+      } else {
+        html += `<div class="combo-item add-new" data-v="${escapeHtml(q.trim())}">+ เพิ่ม "${escapeHtml(q.trim())}"</div>`;
+      }
     }
     if(!html){ html = `<div class="combo-item" style="color:var(--text-faint)">ไม่มีตัวเลือก พิมพ์เพื่อเพิ่มใหม่</div>`; }
     list.innerHTML = html;
@@ -269,7 +281,7 @@ function mountCombo(container, opts){
     const v = item.getAttribute('data-v');
     input.value = v;
     list.classList.remove('open');
-    if(opts.onPick) opts.onPick(v);
+    if(opts.onPick) opts.onPick(v, item.getAttribute('data-add') || null);
   });
   return { getValue: ()=>input.value.trim(), setValue:(v)=>{ input.value=v; } };
 }
@@ -307,6 +319,42 @@ document.addEventListener('click', (e)=>{
 });
 
 /* ---- care-log item helpers (an entry can hold several products) ---- */
+/* Fertiliser and chemical are tracked as separate categories on each line,
+   because one round routinely mixes both and the split is what the cost
+   breakdown is actually asked to answer. */
+const CARE_CATS = [
+  { key:'fertilizer', label:'ปุ๋ย',  product:'fertilize', color:'#2F6BFF' },
+  { key:'pesticide',  label:'ยา',    product:'spray',     color:'#8B5CF6' },
+  { key:'other',      label:'อื่นๆ', product:'other',     color:'#7A8AA8' }
+];
+function catTagHtml(key){
+  const c = catByKey(key);
+  return `<span class="cat-tag cat-${c.key}">${c.label}</span>`;
+}
+function catByKey(k){ return CARE_CATS.find(c=>c.key===k) || CARE_CATS[2]; }
+function catFromProductType(t){
+  const c = CARE_CATS.find(x=>x.product===t);
+  return c ? c.key : 'other';
+}
+/* The category is a property of the product, set once in Settings — so the
+   registry wins. Fixing a mis-filed product there also fixes past reports.
+   Falls back to whatever the entry stored, then to the work type for records
+   made before categories existed. */
+function itemCategoryOf(item, ev){
+  if(item && item.name){
+    const known = productCategory(item.name);
+    if(known) return known;
+  }
+  if(item && item.cat) return item.cat;
+  if(ev && ev.type==='fertilize') return 'fertilizer';
+  if(ev && ev.type==='spray') return 'pesticide';
+  return 'other';
+}
+function productCategory(name){
+  const p = STATE.products.find(x=>x.name===name);
+  return p ? catFromProductType(p.type) : null;
+}
+
 function careItemsOf(ev){
   if(Array.isArray(ev.items) && ev.items.length) return ev.items;
   if(ev.productName || ev.qtyBottles || ev.unitCost){
@@ -319,6 +367,47 @@ function careItemsSummary(ev){
   if(!items.length) return '';
   if(items.length===1) return items[0].name;
   return `${items[0].name} +อีก ${items.length-1} รายการ`;
+}
+/* e.g. "ปุ๋ย 2 · ยา 1" — a quick read of what the round consisted of */
+function careCatCounts(ev){
+  const counts = {};
+  careItemsOf(ev).filter(i=>i.name).forEach(i=>{
+    const k = itemCategoryOf(i, ev);
+    counts[k] = (counts[k]||0) + 1;
+  });
+  return counts;
+}
+function careCatSummary(ev){
+  const counts = careCatCounts(ev);
+  return CARE_CATS.filter(c=>counts[c.key])
+    .map(c=>`${c.label} ${counts[c.key]}`).join(' · ');
+}
+/* coloured version for lists */
+function careCatTags(ev){
+  const counts = careCatCounts(ev);
+  return CARE_CATS.filter(c=>counts[c.key])
+    .map(c=>`<span class="cat-tag cat-${c.key}">${c.label} ${counts[c.key]}</span>`).join('');
+}
+
+/* Cost split by category for a period, used by the analysis breakdown. */
+function categoryCostTotals(matchFn){
+  const t = { fertilizer:0, pesticide:0, other:0, labor:0, fuel:0 };
+  STATE.careEvents.filter(e=>matchFn(e.date)).forEach(e=>{
+    let itemsSum = 0;
+    careItemsOf(e).forEach(it=>{
+      const cost = (Number(it.qty)||0) * (Number(it.unitCost)||0);
+      t[itemCategoryOf(it, e)] += cost;
+      itemsSum += cost;
+    });
+    // otherCost, plus anything a legacy entry recorded only as a total
+    const rest = (Number(e.totalCost)||0) - itemsSum;
+    if(rest > 0) t.other += rest;
+  });
+  STATE.harvests.filter(h=>matchFn(h.date)).forEach(h=>{
+    t.labor += Number(h.laborCost)||0;
+    t.fuel  += Number(h.fuelCost)||0;
+  });
+  return t;
 }
 
 /* ============================== ROUTER ============================== */
@@ -377,6 +466,53 @@ function yearStats(y){
   const revenue = hInYear.reduce((s,h)=>s+harvestRevenueOf(h),0);
   const totalCost = careCost + harvestCost;
   return { careCost, harvestCost, totalCost, revenue, profit: revenue-totalCost };
+}
+
+/* ---- unit economics ----
+   Turning totals into per-kilo numbers is what makes the figures usable:
+   "this plot costs ฿18/kg to run and sells at ฿35" answers whether a price
+   from a buyer is worth taking, which a monthly total never does. */
+function economicsFor(rows, matchFn){
+  const cost = STATE.careEvents
+      .filter(e=>rows.includes(e.plotId) && matchFn(e.date))
+      .reduce((s,e)=>s+careCostOf(e),0)
+    + STATE.harvests
+      .filter(h=>rows.includes(h.plotId) && matchFn(h.date))
+      .reduce((s,h)=>s+harvestCostOf(h),0);
+  const hs = STATE.harvests.filter(h=>rows.includes(h.plotId) && matchFn(h.date));
+  const kg = hs.reduce((s,h)=>s+(Number(h.weightKg)||0),0);
+  const revenue = hs.reduce((s,h)=>s+harvestRevenueOf(h),0);
+  return {
+    cost, revenue, kg,
+    profit: revenue-cost,
+    costPerKg: kg>0 ? cost/kg : null,
+    pricePerKg: kg>0 ? revenue/kg : null,
+    profitPerKg: kg>0 ? (revenue-cost)/kg : null,
+    // at the price actually achieved, how many kilos cover the spending
+    breakEvenKg: (kg>0 && revenue>0) ? cost/(revenue/kg) : null
+  };
+}
+
+function plotEconomics(matchFn){
+  return STATE.plots.map(p=>{
+    const e = economicsFor([p.id], matchFn);
+    e.plot = p;
+    e.profitPerTree = (Number(p.treeCount)||0) > 0 ? e.profit/Number(p.treeCount) : null;
+    return e;
+  });
+}
+
+function fruitEconomics(matchFn){
+  const byFruit = {};
+  STATE.plots.forEach(p=>{
+    const f = p.fruitType || 'ไม่ระบุชนิด';
+    (byFruit[f] = byFruit[f] || []).push(p.id);
+  });
+  return Object.keys(byFruit).map(f=>{
+    const e = economicsFor(byFruit[f], matchFn);
+    e.fruit = f;
+    return e;
+  });
 }
 
 function last6Months(){
@@ -510,7 +646,7 @@ function renderDashboard(){
       sub = `${fmtNum(r.d.weightKg)} กก. · ${escapeHtml(r.d.fruitType||'')}`;
       end = `<div class="tl-amt">฿${fmtMoney(harvestRevenueOf(r.d))}</div>`;
     }
-    return `<div class="tl-item ${cls}">
+    return `<div class="tl-item ${cls}" data-rec="${r.type}" data-rec-id="${r.d.id}">
       <div class="tl-rail"><span class="tl-dot"></span><span class="tl-line"></span></div>
       <div class="tl-body">
         <div style="min-width:0"><div class="tl-title">${title}</div><div class="tl-sub">${sub}</div></div>
@@ -580,6 +716,8 @@ function renderDashboard(){
       ${recent.length? recent.map(recentRow).join('') : `<div class="empty"><span class="emoji">🌱</span><div class="title">ยังไม่มีกิจกรรม</div><div class="desc">แตะปุ่ม + เพื่อเริ่มบันทึกการดูแลสวน</div></div>`}
     </div>
   `;
+
+  wireRecordRows(root);   // กิจกรรมล่าสุด rows open the record they came from
 
   // plot preview
   const prev = document.getElementById('dashPlotPreview');
@@ -698,7 +836,9 @@ function openPlotForm(existing){
 
 /* ============================== RENDER: PLOT DETAIL ============================== */
 let activePlotId = null;
+let pdShowAll = { care:false, health:false, harvest:false };
 function openPlotDetail(id){
+  if(activePlotId !== id) pdShowAll = { care:false, health:false, harvest:false };
   activePlotId = id;
   showView('plotDetail');
 }
@@ -710,9 +850,18 @@ function renderPlotDetail(id){
   const status = plotHealthStatus(p.id);
   const badge = status==='urgent'?'<span class="badge badge-urgent">ต้องดูแลด่วน</span>':(status==='watch'?'<span class="badge badge-watch">เฝ้าระวัง</span>':'<span class="badge badge-ok">สุขภาพดี</span>');
 
-  const careHist = STATE.careEvents.filter(e=>e.plotId===p.id).sort((a,b)=>a.date<b.date?1:-1).slice(0,8);
-  const healthHist = STATE.healthIssues.filter(h=>h.plotId===p.id).sort((a,b)=>a.date<b.date?1:-1);
-  const harvestHist = STATE.harvests.filter(h=>h.plotId===p.id).sort((a,b)=>a.date<b.date?1:-1).slice(0,8);
+  // Lists are capped for readability, but nothing may be unreachable — every
+  // capped list gets a "show all" toggle so any record can still be opened.
+  const PD_CAP = 6;
+  const careAll = STATE.careEvents.filter(e=>e.plotId===p.id).sort((a,b)=>a.date<b.date?1:-1);
+  const healthAll = STATE.healthIssues.filter(h=>h.plotId===p.id).sort((a,b)=>a.date<b.date?1:-1);
+  const harvestAll = STATE.harvests.filter(h=>h.plotId===p.id).sort((a,b)=>a.date<b.date?1:-1);
+  const careHist = pdShowAll.care ? careAll : careAll.slice(0,PD_CAP);
+  const healthHist = pdShowAll.health ? healthAll : healthAll.slice(0,PD_CAP);
+  const harvestHist = pdShowAll.harvest ? harvestAll : harvestAll.slice(0,PD_CAP);
+  const moreBtn = (key, shown, total)=> total>shown
+    ? `<button class="btn btn-ghost btn-block btn-sm" data-more="${key}">ดูทั้งหมด (${total} รายการ)</button>`
+    : (pdShowAll[key] && total>PD_CAP ? `<button class="btn btn-ghost btn-block btn-sm" data-more="${key}">ย่อรายการ</button>` : '');
   const totalHarvestKg = STATE.harvests.filter(h=>h.plotId===p.id).reduce((s,h)=>s+(Number(h.weightKg)||0),0);
   const totalRevenue = STATE.harvests.filter(h=>h.plotId===p.id).reduce((s,h)=>s+harvestRevenueOf(h),0);
   const totalCost = STATE.careEvents.filter(e=>e.plotId===p.id).reduce((s,e)=>s+careCostOf(e),0) + STATE.harvests.filter(h=>h.plotId===p.id).reduce((s,h)=>s+harvestCostOf(h),0);
@@ -736,19 +885,27 @@ function renderPlotDetail(id){
 
     <div class="section-title"><h2>สุขภาพต้นไม้</h2><span class="link" data-add="health">+ บันทึก</span></div>
     <div class="list">
-      ${healthHist.length? healthHist.slice(0,6).map(h=>healthRowHtml(h)).join('') : `<div class="empty"><div class="desc">ยังไม่มีบันทึกปัญหาสุขภาพ</div></div>`}
+      ${healthHist.length? healthHist.map(h=>healthRowHtml(h)).join('') : `<div class="empty"><div class="desc">ยังไม่มีบันทึกปัญหาสุขภาพ</div></div>`}
+      ${moreBtn('health', healthHist.length, healthAll.length)}
     </div>
 
     <div class="section-title"><h2>ประวัติการดูแล</h2><span class="link" data-add="care">+ บันทึก</span></div>
     <div class="list">
       ${careHist.length? careHist.map(e=>careRowHtml(e)).join('') : `<div class="empty"><div class="desc">ยังไม่มีบันทึกการดูแล</div></div>`}
+      ${moreBtn('care', careHist.length, careAll.length)}
     </div>
 
     <div class="section-title"><h2>ประวัติการเก็บเกี่ยว</h2><span class="link" data-add="harvest">+ บันทึก</span></div>
     <div class="list">
       ${harvestHist.length? harvestHist.map(h=>harvestRowHtml(h)).join('') : `<div class="empty"><div class="desc">ยังไม่มีบันทึกการเก็บเกี่ยว</div></div>`}
+      ${moreBtn('harvest', harvestHist.length, harvestAll.length)}
     </div>
   `;
+  root.querySelectorAll('[data-more]').forEach(b=>b.addEventListener('click', ()=>{
+    const k = b.getAttribute('data-more');
+    pdShowAll[k] = !pdShowAll[k];
+    renderPlotDetail(p.id);
+  }));
   document.getElementById('pdBack').addEventListener('click', ()=>showView('plots'));
   document.getElementById('pdEdit').addEventListener('click', ()=>openPlotForm(p));
   root.querySelectorAll('[data-add]').forEach(el=>el.addEventListener('click', ()=>{
@@ -781,11 +938,14 @@ function healthRowHtml(h){
 function careRowHtml(e){
   const meta = taskTypeMeta(e.type);
   const items = careItemsOf(e).filter(i=>i.name);
+  const tags = careCatTags(e);
   const sub = items.length>1
-    ? items.map(i=>i.name).join(' · ')
+    ? items.map(i=>i.name).join(', ')
     : (items.length===1 && items[0].qty ? fmtNum(items[0].qty)+' ขวด' : '');
   return `<div class="row-card" data-edit-care="${e.id}"><div class="row-icon ${meta.cls}" style="color:${meta.color}">${meta.icon}</div>
-    <div class="row-main"><div class="row-title">${meta.label}${items.length===1?(' · '+escapeHtml(items[0].name)):(items.length>1?(' · '+items.length+' รายการ'):'')}</div><div class="row-sub">${escapeHtml(sub)}</div></div>
+    <div class="row-main"><div class="row-title">${meta.label}${items.length===1?(' · '+escapeHtml(items[0].name)):(items.length>1?(' · '+items.length+' รายการ'):'')}</div>
+      ${tags?`<div class="tag-row" style="margin-top:5px">${tags}</div>`:''}
+      ${sub?`<div class="row-sub">${escapeHtml(sub)}</div>`:''}</div>
     <div class="row-end"><div class="num">฿${fmtMoney(e.totalCost)}</div><div class="muted">${fmtDateShort(e.date)}</div></div></div>`;
 }
 function harvestRowHtml(h){
@@ -803,8 +963,17 @@ function openCareForm(existing, presetPlotId){
   const isEdit = !!existing;
   const plotId = existing? existing.plotId : presetPlotId;
   const type = existing? existing.type : 'spray';
-  let items = existing ? careItemsOf(existing).map(i=>({name:i.name||'', qty:i.qty||'', unitCost:i.unitCost||''})) : [];
-  if(!items.length) items = [{name:'', qty:'', unitCost:''}];
+  let items = existing
+    ? careItemsOf(existing).map(i=>({ name:i.name||'', qty:i.qty||'', unitCost:i.unitCost||'',
+        cat: itemCategoryOf(i, existing) }))
+    : [];
+  items.forEach(it=>{ if(it.name) it.cat = productCategory(it.name) || it.cat || 'other'; });
+  const defaultCat = ()=>{
+    const t = sheet.querySelector('#careType .chip.active');
+    const v = t ? t.getAttribute('data-t') : type;
+    return v==='fertilize' ? 'fertilizer' : (v==='spray' ? 'pesticide' : 'other');
+  };
+  if(!items.length) items = [{name:'', qty:'', unitCost:'', cat:'other'}];
 
   const sheet = document.getElementById('sheetGeneric');
   sheet.innerHTML = `
@@ -859,6 +1028,8 @@ function openCareForm(existing, presetPlotId){
       items[i].name = row.querySelector('.combo-input').value.trim();
       items[i].qty = row.querySelector('.ir-qty').value;
       items[i].unitCost = row.querySelector('.ir-unit').value;
+      const known = productCategory(items[i].name);
+      if(known) items[i].cat = known;
     });
   }
   function grandTotal(){
@@ -877,10 +1048,13 @@ function openCareForm(existing, presetPlotId){
   }
   function renderItems(){
     itemsWrap.innerHTML = items.map((it,i)=>`
-      <div class="item-row" data-i="${i}">
+      <div class="item-row cat-edge cat-${it.cat||'other'}" data-i="${i}">
         <div class="ir-head">
           <span class="ir-num">รายการที่ ${i+1}</span>
-          ${items.length>1?`<button class="mini-remove" data-rm="${i}" type="button">ลบ</button>`:''}
+          <span class="ir-right">
+            <span class="ir-cat">${it.name ? catTagHtml(it.cat||'other') : '<span class="cat-tag cat-none">ยังไม่ได้เลือก</span>'}</span>
+            ${items.length>1?`<button class="mini-remove" data-rm="${i}" type="button">ลบ</button>`:''}
+          </span>
         </div>
         <div class="field"><div class="ir-combo"></div></div>
         <div class="row2">
@@ -891,11 +1065,32 @@ function openCareForm(existing, presetPlotId){
       </div>
     `).join('');
     itemsWrap.querySelectorAll('.item-row').forEach((row,i)=>{
+      // repaint the colour band + tag whenever the chosen product changes
+      const setCat = (k)=>{
+        items[i].cat = k;
+        CARE_CATS.forEach(c=>row.classList.toggle('cat-'+c.key, c.key===k));
+        row.querySelector('.ir-cat').innerHTML = catTagHtml(k);
+      };
       mountCombo(row.querySelector('.ir-combo'), {
         placeholder:'เช่น ปุ๋ยสูตร 15-15-15, ยาฆ่าแมลง...',
         value: items[i].name,
         getOptions: productOptions,
-        onPick:(v)=>{ if(v && !STATE.products.some(p=>p.name===v)){ STATE.products.push(touch({id:uid(), name:v, type:'other'})); saveState(); } }
+        getOptionMeta: (name)=>{ const k = productCategory(name); return k ? catTagHtml(k) : ''; },
+        addOptions: CARE_CATS.map(c=>({key:c.key, label:c.label, tag:catTagHtml(c.key)})),
+        onPick:(v, addCat)=>{
+          if(!v) return;
+          // a name that isn't in Settings yet still needs a category, so the
+          // list offers to file it on the spot rather than blocking the entry
+          if(addCat){
+            if(!STATE.products.some(p=>p.name===v)){
+              STATE.products.push(touch({ id:uid(), name:v, type: catByKey(addCat).product }));
+              saveState();
+            }
+            setCat(addCat);
+            return;
+          }
+          setCat(productCategory(v) || 'other');
+        }
       });
       row.querySelectorAll('.ir-qty, .ir-unit').forEach(inp=>inp.addEventListener('input', refreshTotals));
       const rm = row.querySelector('[data-rm]');
@@ -911,7 +1106,7 @@ function openCareForm(existing, presetPlotId){
 
   document.getElementById('cfAddItem').addEventListener('click', ()=>{
     readItemsFromDOM();
-    items.push({name:'', qty:'', unitCost:''});
+    items.push({name:'', qty:'', unitCost:'', cat:'other'});
     renderItems();
     const last = itemsWrap.lastElementChild;
     if(last && typeof last.scrollIntoView === 'function') last.scrollIntoView({block:'nearest', behavior:'smooth'});
@@ -924,7 +1119,15 @@ function openCareForm(existing, presetPlotId){
     readItemsFromDOM();
     const cleanItems = items
       .filter(it=>it.name || Number(it.qty) || Number(it.unitCost))
-      .map(it=>({ name: it.name, qty: Number(it.qty)||0, unitCost: Number(it.unitCost)||0 }));
+      .map(it=>({ name: it.name, cat: it.cat || 'other',
+                  qty: Number(it.qty)||0, unitCost: Number(it.unitCost)||0 }));
+    // categories are owned by Settings; just make sure the product exists there
+    cleanItems.forEach(it=>{
+      if(!it.name) return;
+      if(!STATE.products.some(x=>x.name===it.name)){
+        STATE.products.push(touch({ id:uid(), name:it.name, type: catByKey(it.cat||'other').product }));
+      }
+    });
     const otherCost = Number(otherEl.value)||0;
     const total = cleanItems.reduce((s,it)=>s + it.qty*it.unitCost, 0) + otherCost;
     const data = {
@@ -1097,6 +1300,30 @@ function openHarvestForm(existing, presetPlotId){
   openSheet('sheetGeneric');
 }
 
+/* One place that knows how to open any record for editing, so a row in any
+   list can be made tappable without duplicating the lookup logic. */
+function openRecord(kind, id){
+  if(kind==='care'){
+    const e = STATE.careEvents.find(x=>x.id===id); if(e) openCareForm(e);
+  } else if(kind==='health'){
+    const h = STATE.healthIssues.find(x=>x.id===id); if(h) openHealthForm(h);
+  } else if(kind==='harvest'){
+    const h = STATE.harvests.find(x=>x.id===id); if(h) openHarvestForm(h);
+  } else if(kind==='task'){
+    const t = STATE.tasks.find(x=>x.id===id); if(t) openTaskForm(t);
+  } else if(kind==='plot'){
+    const pl = plotById(id); if(pl) openPlotForm(pl);
+  }
+}
+/* Wires every [data-rec] row inside a container to open its record. */
+function wireRecordRows(root){
+  if(!root) return;
+  root.querySelectorAll('[data-rec]').forEach(el=>el.addEventListener('click', (ev)=>{
+    if(ev.target.closest('button')) return;
+    openRecord(el.getAttribute('data-rec'), el.getAttribute('data-rec-id'));
+  }));
+}
+
 function refreshCurrentView(){
   if(window.__renderView) window.__renderView(currentView, {});
 }
@@ -1236,13 +1463,19 @@ function openTaskForm(existing){
 /* ============================== RENDER: ANALYSIS ============================== */
 let analysisMonth = thisMonthKey();
 let analysisYear = new Date().getFullYear();
-let analysisMode = 'month'; // 'month' | 'year'
+let analysisMode = 'month'; // 'month' | 'year' | 'all'
 
 function renderAnalysis(){
   const root = document.getElementById('view-analysis');
   const isYear = analysisMode==='year';
+  const isAll  = analysisMode==='all';
   let headerLabel, st, periodMatch;
-  if(isYear){
+  if(isAll){
+    headerLabel = 'ตั้งแต่เริ่มบันทึก';
+    periodMatch = ()=>true;
+    const all = economicsFor(STATE.plots.map(p=>p.id), periodMatch);
+    st = { totalCost: all.cost, revenue: all.revenue, profit: all.profit };
+  } else if(isYear){
     headerLabel = 'ปี ' + (analysisYear+543);
     st = yearStats(analysisYear);
     periodMatch = (dateStr)=> dateStr.slice(0,4)===String(analysisYear);
@@ -1256,13 +1489,14 @@ function renderAnalysis(){
   root.innerHTML = `
     <h2 style="font-size:19px; margin-bottom:12px">วิเคราะห์ต้นทุน</h2>
     <div class="chip-group" id="anModeChips" style="margin-bottom:12px">
-      <div class="chip ${!isYear?'active':''}" data-mode="month">รายเดือน</div>
+      <div class="chip ${analysisMode==='month'?'active':''}" data-mode="month">รายเดือน</div>
       <div class="chip ${isYear?'active':''}" data-mode="year">รายปี</div>
+      <div class="chip ${isAll?'active':''}" data-mode="all">ทั้งหมด</div>
     </div>
     <div class="flex-between card" style="margin-bottom:14px; padding:10px 14px">
-      <button class="icon-btn" id="amPrev">${ICONS.back}</button>
+      ${isAll?'<span style="width:42px"></span>':`<button class="icon-btn" id="amPrev">${ICONS.back}</button>`}
       <div style="font-weight:700; font-size:14.5px">${headerLabel}</div>
-      <button class="icon-btn" id="amNext" style="transform:rotate(180deg)">${ICONS.back}</button>
+      ${isAll?'<span style="width:42px"></span>':`<button class="icon-btn" id="amNext" style="transform:rotate(180deg)">${ICONS.back}</button>`}
     </div>
     <div class="bento">
       <div class="card stat-card tint-blue"><div class="label">ต้นทุนรวม</div><div class="value mono num">฿${fmtMoney(st.totalCost)}</div></div>
@@ -1271,6 +1505,18 @@ function renderAnalysis(){
     </div>
 
     ${isYear? `<div class="section-title"><h2>รายได้-ต้นทุนรายเดือนในปีนี้</h2></div><div class="card" id="anYearMonthly"></div><div class="chart-legend" style="padding:0 4px"><span><span class="dot" style="background:var(--blue)"></span>ต้นทุน</span><span><span class="dot" style="background:var(--peach)"></span>รายได้</span></div>` : ''}
+
+    <div class="section-title"><h2>ต้นทุนต่อกิโล · จุดคุ้มทุน</h2></div>
+    <div id="anUnit"></div>
+
+    <div class="section-title"><h2>เทียบรายแปลง</h2></div>
+    <div id="anPlotTable"></div>
+
+    <div class="section-title"><h2>เทียบตามชนิดผลไม้</h2></div>
+    <div id="anFruitTable"></div>
+
+    <div class="section-title"><h2>ค่าปุ๋ย เทียบกับ ค่ายา</h2></div>
+    <div class="bento" id="anCatSplit"></div>
 
     <div class="section-title"><h2>สัดส่วนต้นทุน</h2></div>
     <div class="card" id="anDonut"></div>
@@ -1281,8 +1527,9 @@ function renderAnalysis(){
     <div class="section-title"><h2>รายการค่าใช้จ่ายสูงสุด (Top 5)</h2></div>
     <div class="list" id="anTop5"></div>
   `;
-  document.getElementById('amPrev').addEventListener('click', ()=>{ isYear? shiftYear(-1) : shiftMonth(-1); });
-  document.getElementById('amNext').addEventListener('click', ()=>{ isYear? shiftYear(1) : shiftMonth(1); });
+  if(document.getElementById('amPrev')) document.getElementById('amPrev').addEventListener('click', ()=>{ isYear? shiftYear(-1) : shiftMonth(-1); });
+  if(document.getElementById('amNext')) document.getElementById('amNext').addEventListener('click', ()=>{ isYear? shiftYear(1) : shiftMonth(1); });
+  renderUnitEconomics(periodMatch, isAll);
   document.querySelectorAll('#anModeChips .chip').forEach(ch=>ch.addEventListener('click', ()=>{
     analysisMode = ch.getAttribute('data-mode'); renderAnalysis();
   }));
@@ -1297,19 +1544,38 @@ function renderAnalysis(){
     barChart(document.getElementById('anYearMonthly'), monthsData, {h:150, colorA:'var(--blue)', colorB:'var(--peach)'});
   }
 
-  // donut: category breakdown (period-aware)
+  // donut: split by the category of each line, so a round that mixed
+  // fertiliser and chemical is counted under both rather than one work type
   const careInPeriod = STATE.careEvents.filter(e=>periodMatch(e.date));
   const harvestsInPeriod = STATE.harvests.filter(h=>periodMatch(h.date));
-  const catTotals = { spray:0, fertilize:0, water:0, other:0, labor:0, fuel:0 };
-  careInPeriod.forEach(e=>{ catTotals[e.type] = (catTotals[e.type]||0) + careCostOf(e); });
-  harvestsInPeriod.forEach(h=>{ catTotals.labor += Number(h.laborCost)||0; catTotals.fuel += Number(h.fuelCost)||0; });
+  const catTotals = categoryCostTotals(periodMatch);
   const donutData = [
-    {label:'พ่นยา', value:catTotals.spray, color:'var(--lavender)'},
-    {label:'ปุ๋ย', value:catTotals.fertilize, color:'var(--blue)'},
+    {label:'ค่าปุ๋ย', value:catTotals.fertilizer, color:catByKey('fertilizer').color},
+    {label:'ค่ายา', value:catTotals.pesticide, color:catByKey('pesticide').color},
     {label:'ค่าแรงเก็บเกี่ยว', value:catTotals.labor, color:'var(--peach)'},
     {label:'ค่าน้ำมัน', value:catTotals.fuel, color:'var(--pink)'},
-    {label:'อื่นๆ', value:catTotals.other+catTotals.water, color:'var(--text-faint)'}
+    {label:'อื่นๆ', value:catTotals.other, color:'var(--text-faint)'}
   ].filter(d=>d.value>0);
+  // ปุ๋ย vs ยา headline
+  const splitBox = document.getElementById('anCatSplit');
+  const fert = catTotals.fertilizer, pest = catTotals.pesticide;
+  if(fert || pest){
+    const sum = fert + pest;
+    splitBox.innerHTML = `
+      <div class="card stat-card cat-tint-fertilizer">
+        <div class="label">ค่าปุ๋ย</div>
+        <div class="value mono num">฿${fmtMoney(fert)}</div>
+        <div class="delta muted">${sum?Math.round(fert/sum*100):0}% ของค่าปุ๋ย+ยา</div>
+      </div>
+      <div class="card stat-card cat-tint-pesticide">
+        <div class="label">ค่ายา</div>
+        <div class="value mono num">฿${fmtMoney(pest)}</div>
+        <div class="delta muted">${sum?Math.round(pest/sum*100):0}% ของค่าปุ๋ย+ยา</div>
+      </div>`;
+  } else {
+    splitBox.innerHTML = `<div class="card span2"><p class="muted">ยังไม่มีค่าปุ๋ยหรือค่ายาในช่วงนี้</p></div>`;
+  }
+
   donutChart(document.getElementById('anDonut'), donutData, {});
   if(!donutData.length) document.getElementById('anDonut').innerHTML = `<div class="empty"><div class="desc">ยังไม่มีค่าใช้จ่ายใน${isYear?'ปีนี้':'เดือนนี้'}</div></div>`;
 
@@ -1324,18 +1590,136 @@ function renderAnalysis(){
 
   // top 5 expenses (individual entries, period-aware)
   let entries = [];
-  careInPeriod.forEach(e=>entries.push({date:e.date, label:taskTypeMeta(e.type).label+(careItemsSummary(e)?(' · '+careItemsSummary(e)):''), plot:plotById(e.plotId), cost:careCostOf(e)}));
+  careInPeriod.forEach(e=>entries.push({kind:'care', id:e.id, date:e.date, label:taskTypeMeta(e.type).label+(careItemsSummary(e)?(' · '+careItemsSummary(e)):''), plot:plotById(e.plotId), cost:careCostOf(e)}));
   harvestsInPeriod.forEach(h=>{
-    const c = harvestCostOf(h); if(c>0) entries.push({date:h.date, label:'ค่าแรง/น้ำมันเก็บเกี่ยว', plot:plotById(h.plotId), cost:c});
+    const c = harvestCostOf(h); if(c>0) entries.push({kind:'harvest', id:h.id, date:h.date, label:'ค่าแรง/น้ำมันเก็บเกี่ยว', plot:plotById(h.plotId), cost:c});
   });
   entries.sort((a,b)=>b.cost-a.cost);
   entries = entries.slice(0,5);
   document.getElementById('anTop5').innerHTML = entries.length ? entries.map(en=>`
-    <div class="row-card" style="cursor:default"><div class="row-icon tint-blue" style="color:var(--blue-deep)">${ICONS.chart}</div>
+    <div class="row-card" data-rec="${en.kind}" data-rec-id="${en.id}"><div class="row-icon tint-blue" style="color:var(--blue-deep)">${ICONS.chart}</div>
       <div class="row-main"><div class="row-title">${escapeHtml(en.label)}</div><div class="row-sub">${en.plot?escapeHtml(en.plot.name):''}</div></div>
       <div class="row-end"><div class="num">฿${fmtMoney(en.cost)}</div><div class="muted">${fmtDateShort(en.date)}</div></div></div>
   `).join('') : `<div class="empty"><div class="desc">ยังไม่มีรายการค่าใช้จ่ายใน${isYear?'ปีนี้':'เดือนนี้'}</div></div>`;
+  wireRecordRows(document.getElementById('anTop5'));
 }
+/* Renders the per-kilo panel, the plot table and the fruit comparison.
+   Everything here is written so the answer is readable without doing maths:
+   the break-even price is stated as a price, and each plot is labelled
+   "คุ้ม" or "ขาดทุน" outright. */
+function renderUnitEconomics(periodMatch, isAll){
+  const wrap = document.getElementById('anUnit');
+  if(!wrap) return;
+  const all = economicsFor(STATE.plots.map(p=>p.id), periodMatch);
+
+  if(!all.kg){
+    wrap.innerHTML = `<div class="card"><div class="empty" style="padding:24px 12px">
+      <span class="emoji">⚖️</span>
+      <div class="title">ยังคำนวณต้นทุนต่อกิโลไม่ได้</div>
+      <div class="desc">ช่วงนี้ยังไม่มีบันทึกการเก็บเกี่ยว${isAll?'':' — ลองกดดู "ทั้งหมด"'}<br>
+      พอบันทึกน้ำหนักที่เก็บได้แล้ว ตัวเลขจะขึ้นให้เอง</div></div></div>`;
+    document.getElementById('anPlotTable').innerHTML = '';
+    document.getElementById('anFruitTable').innerHTML = '';
+    return;
+  }
+
+  const good = all.profitPerKg >= 0;
+  wrap.innerHTML = `
+    <div class="bento">
+      <div class="card stat-card tint-blue">
+        <div class="label">ต้นทุนต่อกิโล</div>
+        <div class="value mono num">฿${fmtNum(all.costPerKg)}</div>
+        <div class="delta muted">จาก ${fmtNum(all.kg)} กก.</div>
+      </div>
+      <div class="card stat-card tint-peach">
+        <div class="label">ราคาขายเฉลี่ย</div>
+        <div class="value mono num">฿${fmtNum(all.pricePerKg)}</div>
+        <div class="delta muted">ต่อกิโล</div>
+      </div>
+      <div class="card stat-card span2 ${good?'tint-lavender':'tint-pink'}">
+        <div class="label">กำไรต่อกิโล</div>
+        <div class="value mono num">${good?'':'-'}฿${fmtNum(Math.abs(all.profitPerKg))}</div>
+      </div>
+    </div>
+    <div class="insight ${good?'':'bad'}">
+      <div class="ins-title">${good?'ขายได้สูงกว่าทุน':'ตอนนี้ขายต่ำกว่าทุน'}</div>
+      <p>ต้องขายให้ได้อย่างน้อย <b>฿${fmtNum(all.costPerKg)}/กก.</b> ถึงจะเท่าทุน
+      ${good
+        ? `ตอนนี้ขายได้เฉลี่ย ฿${fmtNum(all.pricePerKg)} เหลือกำไรกิโลละ ฿${fmtNum(all.profitPerKg)}`
+        : `ตอนนี้ขายได้เฉลี่ย ฿${fmtNum(all.pricePerKg)} ขาดทุนกิโลละ ฿${fmtNum(Math.abs(all.profitPerKg))}`}</p>
+      <p style="margin-top:6px">${all.kg >= all.breakEvenKg
+        ? `คืนทุนไปแล้วตั้งแต่กิโลที่ <b>${fmtNum(all.breakEvenKg)}</b> — ที่เก็บได้เกินจากนั้นคือกำไร`
+        : `ที่ราคานี้ ต้องเก็บขายให้ครบ <b>${fmtNum(all.breakEvenKg)} กก.</b> ถึงจะคืนทุน ยังขาดอีก <b>${fmtNum(all.breakEvenKg - all.kg)} กก.</b>`}</p>
+    </div>
+  `;
+
+  // ---- per plot ----
+  const plots = plotEconomics(periodMatch).filter(e=>e.kg>0 || e.cost>0);
+  const ptable = document.getElementById('anPlotTable');
+  if(!plots.length){
+    ptable.innerHTML = `<div class="card"><p class="muted">ยังไม่มีข้อมูลรายแปลงในช่วงนี้</p></div>`;
+  } else {
+    plots.sort((a,b)=> (b.profitPerKg==null?-1e9:b.profitPerKg) - (a.profitPerKg==null?-1e9:a.profitPerKg));
+    ptable.innerHTML = `<div class="card" style="padding:6px 0">
+      <table class="tbl">
+        <thead><tr><th>แปลง</th><th class="r">ทุน/กก.</th><th class="r">ขาย/กก.</th><th class="r">กำไร/กก.</th></tr></thead>
+        <tbody>
+        ${plots.map(e=>{
+          const has = e.kg>0;
+          const ok = has && e.profitPerKg>=0;
+          return `<tr>
+            <td><div class="t-name">${escapeHtml(e.plot.name)}</div>
+                <div class="t-sub">${escapeHtml(e.plot.fruitType||'')}${has?` · ${fmtNum(e.kg)} กก.`:' · ยังไม่เก็บเกี่ยว'}</div></td>
+            <td class="r num">${has?'฿'+fmtNum(e.costPerKg):'-'}</td>
+            <td class="r num">${has?'฿'+fmtNum(e.pricePerKg):'-'}</td>
+            <td class="r"><span class="pill ${has?(ok?'ok':'bad'):'na'}">${has?(ok?'+':'-')+'฿'+fmtNum(Math.abs(e.profitPerKg)):'-'}</span></td>
+          </tr>`;
+        }).join('')}
+        </tbody>
+      </table>
+    </div>`;
+
+    // a plain-language read of the table
+    const scored = plots.filter(e=>e.kg>0);
+    if(scored.length>1){
+      const best = scored[0], worst = scored[scored.length-1];
+      const perTree = scored.filter(e=>e.profitPerTree!=null)
+        .sort((a,b)=>b.profitPerTree-a.profitPerTree)[0];
+      ptable.insertAdjacentHTML('beforeend', `
+        <div class="insight" style="margin-top:12px">
+          <div class="ins-title">อ่านจากตาราง</div>
+          <p><b>${escapeHtml(best.plot.name)}</b> คุ้มที่สุด — กำไรกิโลละ ฿${fmtNum(best.profitPerKg)}</p>
+          ${worst.profitPerKg < 0
+            ? `<p style="margin-top:6px"><b>${escapeHtml(worst.plot.name)}</b> ยังขาดทุนกิโลละ ฿${fmtNum(Math.abs(worst.profitPerKg))} — ลองดูว่าต้นทุนไปลงกับอะไรมากผิดปกติ</p>`
+            : `<p style="margin-top:6px">ทุกแปลงขายได้สูงกว่าทุน</p>`}
+          ${perTree ? `<p style="margin-top:6px">ถ้าคิดต่อต้น <b>${escapeHtml(perTree.plot.name)}</b> ให้ผลตอบแทนดีที่สุด ต้นละ ฿${fmtNum(perTree.profitPerTree)}</p>` : ''}
+        </div>`);
+    }
+  }
+
+  // ---- per fruit ----
+  const fruits = fruitEconomics(periodMatch).filter(e=>e.kg>0);
+  const ftable = document.getElementById('anFruitTable');
+  if(!fruits.length){
+    ftable.innerHTML = `<div class="card"><p class="muted">ยังไม่มีข้อมูลผลผลิตในช่วงนี้</p></div>`;
+  } else {
+    fruits.sort((a,b)=>b.profitPerKg-a.profitPerKg);
+    ftable.innerHTML = `<div class="card" style="padding:6px 0">
+      <table class="tbl">
+        <thead><tr><th>ผลไม้</th><th class="r">ผลผลิต</th><th class="r">กำไรรวม</th><th class="r">กำไร/กก.</th></tr></thead>
+        <tbody>
+        ${fruits.map(e=>`<tr>
+          <td><div class="t-name">${escapeHtml(e.fruit)}</div></td>
+          <td class="r num">${fmtNum(e.kg)} กก.</td>
+          <td class="r num">${e.profit>=0?'':'-'}฿${fmtMoney(Math.abs(e.profit))}</td>
+          <td class="r"><span class="pill ${e.profitPerKg>=0?'ok':'bad'}">${e.profitPerKg>=0?'+':'-'}฿${fmtNum(Math.abs(e.profitPerKg))}</span></td>
+        </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+  }
+}
+
 function shiftMonth(delta){
   const d = new Date(analysisMonth+"-01");
   d.setMonth(d.getMonth()+delta);
@@ -1375,6 +1759,60 @@ function renderBuyers(){
     }));
   }
   document.getElementById('btnAddBuyer').addEventListener('click', ()=>openBuyerForm(null));
+}
+
+/* Products are referenced by name inside saved entries, so renaming one has
+   to rewrite those references or old records would lose their category. */
+function openProductForm(existing, onDone){
+  const sheet = document.getElementById('sheetGeneric');
+  const curCat = catFromProductType(existing.type);
+  sheet.innerHTML = `
+    <div class="sheet-handle"></div>
+    <div class="sheet-head"><h3>แก้ไขปุ๋ย/ยา</h3><button class="icon-btn" id="sgClose">${ICONS.close}</button></div>
+    <div class="field"><label>ชื่อ</label><input type="text" id="prName" value="${escapeHtml(existing.name)}"></div>
+    <div class="field"><label>หมวด</label>
+      <div class="chip-group" id="prCat">
+        ${CARE_CATS.map(c=>`<div class="chip ${c.key===curCat?'active':''}" data-cat="${c.key}">${c.label}</div>`).join('')}
+      </div>
+    </div>
+    <button class="btn btn-primary btn-block" id="prSave">บันทึกการแก้ไข</button>
+    <button class="btn btn-danger btn-block" style="margin-top:8px" id="prDelete">ลบรายการนี้</button>
+  `;
+  sheet.querySelectorAll('#prCat .chip').forEach(ch=>ch.addEventListener('click', ()=>{
+    sheet.querySelectorAll('#prCat .chip').forEach(c=>c.classList.remove('active'));
+    ch.classList.add('active');
+  }));
+  document.getElementById('sgClose').addEventListener('click', ()=>closeSheet('sheetGeneric'));
+  document.getElementById('prSave').addEventListener('click', ()=>{
+    const name = document.getElementById('prName').value.trim();
+    if(!name){ toast('กรุณาใส่ชื่อ'); return; }
+    const cat = sheet.querySelector('#prCat .chip.active').getAttribute('data-cat');
+    const oldName = existing.name;
+    existing.name = name;
+    existing.type = catByKey(cat).product;
+    touch(existing);
+    if(oldName !== name){
+      // keep saved entries pointing at this product
+      STATE.careEvents.forEach(ev=>{
+        let changed = false;
+        (ev.items||[]).forEach(it=>{ if(it.name===oldName){ it.name = name; changed = true; } });
+        if(ev.productName===oldName){ ev.productName = name; changed = true; }
+        if(changed) touch(ev);
+      });
+    }
+    saveState(); closeSheet('sheetGeneric'); toast('แก้ไขแล้ว');
+    if(onDone) onDone(); else refreshCurrentView();
+  });
+  document.getElementById('prDelete').addEventListener('click', async ()=>{
+    const ok = await confirmDialog({ title:'ลบรายการนี้?',
+      message:'บันทึกเก่าที่เคยใช้ชื่อนี้จะยังอยู่ แต่จะไม่มีหมวดอ้างอิงจากตั้งค่าแล้ว' });
+    if(!ok) return;
+    STATE.products = STATE.products.filter(x=>x.id!==existing.id);
+    tombstone('products', existing.id);
+    saveState(); closeSheet('sheetGeneric'); toast('ลบแล้ว');
+    if(onDone) onDone(); else refreshCurrentView();
+  });
+  openSheet('sheetGeneric');
 }
 
 function openBuyerForm(existing){
@@ -1611,7 +2049,7 @@ function renderSettings(){
 
     <div class="section-title" style="margin-top:0"><h2>ปุ๋ย/ยาที่ใช้ประจำ</h2></div>
     <div class="card" style="margin-bottom:14px">
-      <div id="stProductCombo" style="margin-bottom:10px"></div>
+      <div id="stProductCombo" style="margin-bottom:12px"></div>
       <div class="mini-list" id="stProductList"></div>
     </div>
 
@@ -1644,17 +2082,59 @@ function renderSettings(){
 
   const prodList = document.getElementById('stProductList');
   function paintProducts(){
-    prodList.innerHTML = STATE.products.length ? STATE.products.map(p=>`
-      <div class="mini-row"><span class="mr-text">${escapeHtml(p.name)}</span><button class="mini-remove" data-rm="${p.id}">ลบ</button></div>
-    `).join('') : `<p class="muted">ยังไม่มีรายการ — พิมพ์ด้านบนเพื่อเพิ่ม</p>`;
+    if(!STATE.products.length){
+      prodList.innerHTML = `<p class="muted">ยังไม่มีรายการ — เลือกหมวดแล้วพิมพ์ชื่อด้านบนเพื่อเพิ่ม</p>`;
+      return;
+    }
+    // grouped so ปุ๋ย and ยา are never mixed together in one list
+    prodList.innerHTML = CARE_CATS.map(c=>{
+      const inCat = STATE.products.filter(p=>catFromProductType(p.type)===c.key);
+      if(!inCat.length) return '';
+      return `<div class="prod-group">
+        <div class="prod-head cat-${c.key}"><span class="cat-dot"></span>${c.label} <span class="cnt">${inCat.length}</span></div>
+        ${inCat.map(p=>`<div class="mini-row cat-edge cat-${c.key}" data-edit-prod="${p.id}">
+          <span class="mr-text">${escapeHtml(p.name)}</span>
+          <span>
+            <button class="mini-move" data-move="${p.id}">ย้ายหมวด</button>
+            <button class="mini-remove" data-rm="${p.id}">ลบ</button>
+          </span></div>`).join('')}
+      </div>`;
+    }).join('');
+
     prodList.querySelectorAll('[data-rm]').forEach(b=>b.addEventListener('click', ()=>{
       const rmId = b.getAttribute('data-rm');
       STATE.products = STATE.products.filter(p=>p.id!==rmId); tombstone('products', rmId); saveState(); paintProducts();
     }));
+    // tapping the name opens the full editor (rename / category / delete)
+    prodList.querySelectorAll('[data-edit-prod]').forEach(row=>row.addEventListener('click', (ev)=>{
+      if(ev.target.closest('button')) return;
+      const prod = STATE.products.find(p=>p.id===row.getAttribute('data-edit-prod'));
+      if(prod) openProductForm(prod, paintProducts);
+    }));
+    // quick shortcut: cycle ปุ๋ย -> ยา -> อื่นๆ without opening the editor
+    prodList.querySelectorAll('[data-move]').forEach(b=>b.addEventListener('click', ()=>{
+      const prod = STATE.products.find(p=>p.id===b.getAttribute('data-move'));
+      if(!prod) return;
+      const i = CARE_CATS.findIndex(c=>c.key===catFromProductType(prod.type));
+      prod.type = CARE_CATS[(i+1)%CARE_CATS.length].product;
+      touch(prod); saveState(); paintProducts();
+    }));
   }
   paintProducts();
-  mountCombo(document.getElementById('stProductCombo'), { placeholder:'พิมพ์ชื่อปุ๋ย/ยาแล้วกด Enter เพื่อเพิ่ม', getOptions:()=>STATE.products.map(p=>p.name),
-    onPick:(v)=>{ if(v && !STATE.products.some(p=>p.name===v)){ STATE.products.push(touch({id:uid(), name:v, type:'other'})); saveState(); paintProducts(); document.getElementById('stProductCombo').querySelector('.combo-input').value=''; } }
+
+  mountCombo(document.getElementById('stProductCombo'), {
+    placeholder:'พิมพ์ชื่อปุ๋ย/ยา แล้วเลือกว่าเป็นอะไร',
+    getOptions:()=>STATE.products.map(p=>p.name),
+    getOptionMeta:(name)=>{ const k = productCategory(name); return k ? catTagHtml(k) : ''; },
+    addOptions: CARE_CATS.map(c=>({key:c.key, label:c.label, tag:catTagHtml(c.key)})),
+    onPick:(v, addCat)=>{
+      if(!v || !addCat) return;
+      if(!STATE.products.some(p=>p.name===v)){
+        STATE.products.push(touch({id:uid(), name:v, type: catByKey(addCat).product}));
+        saveState(); paintProducts();
+      }
+      document.getElementById('stProductCombo').querySelector('.combo-input').value='';
+    }
   });
 
   document.getElementById('stPickLocation').addEventListener('click', ()=>{
@@ -1826,7 +2306,8 @@ function renderWizardStep(){
       <div class="wizard-eyebrow">ขั้นตอน 4 จาก ${WIZARD_TOTAL}</div>
       <div class="wizard-title">ปุ๋ย/ยาประจำ &amp; ความถี่</div>
       <div class="wizard-desc">รายการปุ๋ย/ยาที่ใช้เป็นประจำ และความถี่ในการดูแล (ใช้สร้างงานในปฏิทินให้อัตโนมัติ)</div>
-      <div class="field"><label>เพิ่มปุ๋ย/ยาที่ใช้ประจำ</label><div id="wProductCombo"></div></div>
+      <div class="field"><label>เพิ่มปุ๋ย/ยาที่ใช้ประจำ</label><div id="wProductCombo"></div>
+        <div class="hint">พิมพ์ชื่อแล้วเลือกว่าเป็น ปุ๋ย / ยา / อื่นๆ</div></div>
       <div class="mini-list" id="wProductList"></div>
       <div class="row2" style="margin-top:6px">
         <div class="field"><label>รดน้ำทุกกี่วัน</label><input type="number" id="wWaterFreq" value="${g.wateringFreqDays}" placeholder="เช่น 3"></div>
@@ -1915,16 +2396,37 @@ function wireWizardStep(){
   }
   if(wizardStep===4){
     function paintProducts(){
-      document.getElementById('wProductList').innerHTML = wizardData.products.map((p,i)=>`
-        <div class="mini-row"><span class="mr-text">${escapeHtml(p.name)}</span><button class="mini-remove" data-i="${i}">ลบ</button></div>
-      `).join('');
+      // grouped by category, same as the settings list
+      document.getElementById('wProductList').innerHTML = CARE_CATS.map(c=>{
+        const inCat = wizardData.products
+          .map((p,i)=>({p,i}))
+          .filter(x=>catFromProductType(x.p.type)===c.key);
+        if(!inCat.length) return '';
+        return `<div class="prod-group">
+          <div class="prod-head cat-${c.key}"><span class="cat-dot"></span>${c.label} <span class="cnt">${inCat.length}</span></div>
+          ${inCat.map(x=>`<div class="mini-row cat-edge cat-${c.key}"><span class="mr-text">${escapeHtml(x.p.name)}</span>
+            <button class="mini-remove" data-i="${x.i}">ลบ</button></div>`).join('')}
+        </div>`;
+      }).join('');
       document.getElementById('wProductList').querySelectorAll('[data-i]').forEach(b=>b.addEventListener('click', ()=>{
         wizardData.products.splice(Number(b.getAttribute('data-i')),1); paintProducts();
       }));
     }
     paintProducts();
-    mountCombo(document.getElementById('wProductCombo'), { placeholder:'พิมพ์ชื่อแล้วเลือก "+ เพิ่ม"', getOptions:()=>wizardData.products.map(p=>p.name),
-      onPick:(v)=>{ if(v && !wizardData.products.some(p=>p.name===v)){ wizardData.products.push({id:uid(), name:v, type:'other'}); paintProducts(); document.getElementById('wProductCombo').querySelector('.combo-input').value=''; } }
+    mountCombo(document.getElementById('wProductCombo'), {
+      placeholder:'พิมพ์ชื่อ แล้วเลือกว่าเป็นปุ๋ยหรือยา',
+      getOptions:()=>wizardData.products.map(p=>p.name),
+      getOptionMeta:(name)=>{ const p = wizardData.products.find(x=>x.name===name);
+        return p ? catTagHtml(catFromProductType(p.type)) : ''; },
+      addOptions: CARE_CATS.map(c=>({key:c.key, label:c.label, tag:catTagHtml(c.key)})),
+      onPick:(v, addCat)=>{
+        if(!v || !addCat) return;
+        if(!wizardData.products.some(p=>p.name===v)){
+          wizardData.products.push({id:uid(), name:v, type: catByKey(addCat).product});
+          paintProducts();
+        }
+        document.getElementById('wProductCombo').querySelector('.combo-input').value='';
+      }
     });
   }
   if(wizardStep===5){
@@ -2069,17 +2571,11 @@ window.__boot = boot;
    Conflict rule: last write wins per row, compared on updated_at.
    =================================================================== */
 
-/* ===================================================================
-   ▼▼▼  ใส่ค่าโปรเจกต์ Supabase ตรงนี้ที่เดียว  ▼▼▼
-   หาได้ที่ Supabase → Project Settings → API
-   (anon key ใส่ตรงนี้ได้ปลอดภัย เพราะ RLS เป็นตัวกันข้อมูล
-    ห้ามใส่ service_role key เด็ดขาด)
-   =================================================================== */
-const SUPABASE_URL      = 'https://xkprpjnsxeaiwpyenjxs.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhrcHJwam5zeGVhaXdweWVuanhzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY3ODAzNzQsImV4cCI6MjEwMjM1NjM3NH0.2T3daWv_6SpC4tiJVxmCIErm7YHpT5Dk_GsH0fZbs6k';
-/* ===================================================================
-   ▲▲▲  แก้แค่ 2 บรรทัดข้างบน  ▲▲▲
-   =================================================================== */
+/* Connection details live in config.js, not here, so that updating the app
+   (replacing this file) can never wipe the keys the user pasted in. */
+const SB_CFG = window.SAG_CONFIG || {};
+const SUPABASE_URL      = SB_CFG.SUPABASE_URL      || 'PASTE_SUPABASE_URL_HERE';
+const SUPABASE_ANON_KEY = SB_CFG.SUPABASE_ANON_KEY || 'PASTE_SUPABASE_ANON_KEY_HERE';
 
 const SB_LIB_URL = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js';
 
@@ -2484,8 +2980,9 @@ function renderCloudSection(){
       ${c.lastSyncAt?`<p class="muted" style="margin-bottom:10px">ซิงก์ล่าสุด: ${new Date(c.lastSyncAt).toLocaleString('th-TH')}</p>`:''}
 
       ${!isCloudConfigured() ? `
-        <p class="muted">ยังไม่ได้ใส่ค่า Supabase ในไฟล์โค้ด — เปิดไฟล์ .html แล้วแก้ 2 บรรทัดบนสุด
-        (<span class="num">SUPABASE_URL</span> และ <span class="num">SUPABASE_ANON_KEY</span>)</p>
+        <p class="muted">ยังไม่ได้ใส่ค่า Supabase — เปิดไฟล์ <span class="num">config.js</span>
+        แล้วใส่ <span class="num">SUPABASE_URL</span> กับ <span class="num">SUPABASE_ANON_KEY</span><br>
+        ตอนนี้แอปทำงานแบบออฟไลน์ ข้อมูลเก็บในเครื่องนี้เท่านั้น จึงยังไม่มีหน้าเข้าสู่ระบบ</p>
       ` : signedIn ? `
         <p class="muted" style="margin-bottom:12px">เข้าสู่ระบบด้วย <b>${escapeHtml(sbSession.user.email||'')}</b></p>
         <div style="display:flex; gap:10px">
