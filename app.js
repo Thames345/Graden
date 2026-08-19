@@ -8,51 +8,124 @@
 /* ============================== STORAGE ============================== */
 const STORE_KEY = "sag_v1";
 
+/* ---- state model ----
+   One account can hold any number of gardens. Each garden keeps its own set of
+   records in STATE.data[gardenId]; the active garden's arrays are also exposed
+   as STATE.plots / STATE.careEvents / ... so every screen can go on reading
+   them directly. saveState() folds those aliases back into the bucket first,
+   which keeps reassignments (list = list.filter(...)) safe. */
+const DATA_KEYS = ['plots','products','buyers','careEvents','healthIssues','harvests','tasks'];
+
+function emptyBucket(){
+  return { plots:[], products:[], buyers:[], careEvents:[], healthIssues:[], harvests:[], tasks:[] };
+}
+function blankGarden(){
+  return { name:"", lat:null, lng:null, area:"", areaUnit:"ไร่", startYear:"", harvestSeasons:{} };
+}
+
 function defaultState(){
   return {
-    meta:{ onboarded:false, createdAt: Date.now(), version:1 },
+    meta:{ onboarded:false, createdAt: Date.now(), version:2 },
     user:{ name:"", role:"" },
-    garden:{ name:"", lat:null, lng:null, area:"", areaUnit:"ไร่", startYear:"" },
-    plots:[],
-    products:[],   // {id,name,type:'fertilizer'|'spray'|'other'}
-    buyers:[],     // {id,name,phone,note}
-    careEvents:[], // {id,date,plotId,type,items:[{name,qty,unitCost}],otherCost,totalCost,note}
-    healthIssues:[], // {id,date,plotId,issueType,description,severity,affectedTreeCountEst,status,resolvedDate}
-    harvests:[],   // {id,date,plotId,fruitType,weightKg,count,pricePerKg,buyerId,laborCost,fuelCost,note}
-    tasks:[],      // {id,title,plotId,type,dueDate,recurrenceDays,done,doneDate}
+    gardens:[],            // [{id,name,lat,lng,area,areaUnit,startYear,harvestSeasons,updated_at,dirty}]
+    activeGardenId:'',
+    data:{},               // gardenId -> bucket of that garden's records
     settings:{ notifEnabled:false, lastNotifDate:null },
-    weatherCache:null, // {fetchedAt, current:{}, daily:{}}
-    tombstones:[],     // {table,id,updated_at,dirty} — deletes waiting to sync
-    cloud:{ gardenId:'', lastPull:'', lastSyncAt:'' } // connection details live in code, not here
+    weatherCache:null,     // {fetchedAt, current:{}, daily:{}}
+    tombstones:[],         // {table,id,gardenId,updated_at,dirty} — deletes waiting to sync
+    cloud:{ lastPull:'', lastSyncAt:'' }
   };
 }
 
 let STATE = null;
 
+/* Older saves kept a single garden at the top level. */
+function migrateSingleGarden(parsed, base){
+  const gid = (parsed.cloud && parsed.cloud.gardenId) || uid();
+  const g = Object.assign({ id: gid }, blankGarden(), parsed.garden || {});
+  const bucket = emptyBucket();
+  DATA_KEYS.forEach(k=>{ if(Array.isArray(parsed[k])) bucket[k] = parsed[k]; });
+  base.gardens = [g];
+  base.activeGardenId = gid;
+  base.data = {}; base.data[gid] = bucket;
+  return base;
+}
+
+/* Points STATE.garden and the record arrays at the active garden. */
+function bindActiveGarden(){
+  let gid = STATE.activeGardenId;
+  if(!gid || !STATE.gardens.some(g=>g.id===gid)){
+    gid = STATE.gardens.length ? STATE.gardens[0].id : '';
+    STATE.activeGardenId = gid;
+  }
+  const g = STATE.gardens.find(x=>x.id===gid);
+  STATE.garden = g || blankGarden();
+  if(gid && !STATE.data[gid]) STATE.data[gid] = emptyBucket();
+  const bucket = STATE.data[gid] || emptyBucket();
+  DATA_KEYS.forEach(k=>{ STATE[k] = bucket[k] = (bucket[k] || []); });
+}
+
+/* Folds the aliases back into the stored bucket before persisting. */
+function commitAliases(){
+  const gid = STATE.activeGardenId;
+  if(!gid) return;
+  if(!STATE.data[gid]) STATE.data[gid] = emptyBucket();
+  DATA_KEYS.forEach(k=>{ if(Array.isArray(STATE[k])) STATE.data[gid][k] = STATE[k]; });
+  const g = STATE.gardens.find(x=>x.id===gid);
+  if(g && STATE.garden && STATE.garden !== g){ Object.assign(g, STATE.garden); STATE.garden = g; }
+}
+
 function loadState(){
   try{
     const raw = localStorage.getItem(STORE_KEY);
-    if(!raw) { STATE = defaultState(); return STATE; }
+    if(!raw){ STATE = defaultState(); bindActiveGarden(); return STATE; }
     const parsed = JSON.parse(raw);
-    STATE = Object.assign(defaultState(), parsed);
-    // shallow-merge nested defaults for forward compatibility
-    STATE.meta = Object.assign(defaultState().meta, parsed.meta||{});
-    STATE.user = Object.assign(defaultState().user, parsed.user||{});
-    STATE.garden = Object.assign(defaultState().garden, parsed.garden||{});
-    STATE.settings = Object.assign(defaultState().settings, parsed.settings||{});
-    STATE.cloud = Object.assign(defaultState().cloud, parsed.cloud||{});
-    STATE.tombstones = Array.isArray(parsed.tombstones)? parsed.tombstones : [];
+    const base = defaultState();
+    base.meta = Object.assign(base.meta, parsed.meta||{});
+    base.user = Object.assign(base.user, parsed.user||{});
+    base.settings = Object.assign(base.settings, parsed.settings||{});
+    base.cloud = Object.assign(base.cloud, parsed.cloud||{});
+    base.weatherCache = parsed.weatherCache || null;
+    base.tombstones = Array.isArray(parsed.tombstones)? parsed.tombstones : [];
+
+    let migrated = false;
+    if(Array.isArray(parsed.gardens)){
+      base.gardens = parsed.gardens;
+      base.data = parsed.data || {};
+      base.activeGardenId = parsed.activeGardenId || (parsed.gardens[0] && parsed.gardens[0].id) || '';
+    } else {
+      migrateSingleGarden(parsed, base);
+      migrated = true;
+    }
+    STATE = base;
+    bindActiveGarden();
+    // write the upgraded shape straight back, so the store never lingers in
+    // the old format waiting for the next unrelated edit
+    if(migrated) saveState();
+    return STATE;
   }catch(e){
     console.error("load error", e);
     STATE = defaultState();
   }
+  bindActiveGarden();
   return STATE;
 }
 
 function saveState(){
   // Synchronous write — callers (e.g. finishWizard) may immediately re-render
   // from STATE right after saving, so the store must never lag behind memory.
-  try{ localStorage.setItem(STORE_KEY, JSON.stringify(STATE)); }
+  commitAliases();
+  try{
+    const { meta,user,gardens,activeGardenId,data,settings,weatherCache,tombstones,cloud } = STATE;
+    const payload = JSON.stringify(
+      { meta,user,gardens,activeGardenId,data,settings,weatherCache,tombstones,cloud });
+    localStorage.setItem(STORE_KEY, payload);
+    // Keep a separate cache for every Supabase account.  Previously every
+    // account shared sag_v1, so signing into another account could upload the
+    // previous account's local data or reuse its lastPull watermark.
+    const accountId = cloud && cloud.accountId;
+    if(accountId) localStorage.setItem(STORE_KEY + ':user:' + accountId, payload);
+  }
   catch(e){ console.error("save error", e); toast("บันทึกข้อมูลไม่สำเร็จ (พื้นที่จัดเก็บเต็ม?)"); }
   if(typeof scheduleSync === 'function') scheduleSync();
 }
@@ -70,11 +143,12 @@ function touch(obj){
   obj.dirty = true;
   return obj;
 }
-function tombstone(table, id){
+function tombstone(table, id, gardenId){
   STATE.tombstones = STATE.tombstones || [];
+  const gid = gardenId || STATE.activeGardenId;
   const existing = STATE.tombstones.find(t=>t.table===table && t.id===id);
-  if(existing){ existing.updated_at = new Date().toISOString(); existing.dirty = true; return existing; }
-  const t = { table, id, updated_at:new Date().toISOString(), dirty:true };
+  if(existing){ existing.updated_at = new Date().toISOString(); existing.dirty = true; existing.gardenId = gid; return existing; }
+  const t = { table, id, gardenId:gid, updated_at:new Date().toISOString(), dirty:true };
   STATE.tombstones.push(t);
   return t;
 }
@@ -417,11 +491,21 @@ let currentView = 'dashboard';
 function updateTopbar(){
   const nameEl = document.getElementById('gardenNameTop');
   const metaEl = document.getElementById('gardenMetaTop');
-  if(nameEl) nameEl.textContent = STATE.garden.name || 'สวนอัจฉริยะ';
+  const brand = document.querySelector('.topbar .brand');
+  const many = (STATE.gardens || []).length > 1;
+  if(nameEl) nameEl.textContent = (STATE.garden.name || 'สวนอัจฉริยะ') + (many ? '  ⌄' : '');
   if(metaEl){
     const plots = STATE.plots.length;
     const trees = STATE.plots.reduce((s,p)=>s+(Number(p.treeCount)||0),0);
     metaEl.textContent = plots ? `${plots} แปลง · ${trees} ต้น` : '';
+  }
+  if(brand){
+    // with several gardens the name doubles as the switcher
+    brand.classList.toggle('switchable', many);
+    if(!brand.dataset.wired){
+      brand.dataset.wired = '1';
+      brand.addEventListener('click', ()=>{ if((STATE.gardens||[]).length > 1) showGardenPicker(); });
+    }
   }
 }
 
@@ -753,6 +837,156 @@ function plotCardHtml(p){
     <div class="p-meta">${escapeHtml(p.fruitType||'')} · ${p.treeCount||0} ต้น</div>
     <div style="margin-top:8px">${badge}</div>
   </div>`;
+}
+
+/* ============================== GARDENS ============================== */
+function createGarden(fields){
+  const g = touch(Object.assign({ id: uid() }, blankGarden(), fields || {}));
+  STATE.gardens.push(g);
+  STATE.data[g.id] = emptyBucket();
+  return g;
+}
+function switchGarden(id){
+  if(!STATE.gardens.some(g=>g.id===id)) return;
+  gardenChosen = true;             // an explicit choice; stop asking this session
+  commitAliases();                 // keep the garden we are leaving intact
+  STATE.activeGardenId = id;
+  bindActiveGarden();
+  saveState();
+  updateTopbar();
+  showView('dashboard');
+}
+function gardenStats(gid){
+  const b = STATE.data[gid] || emptyBucket();
+  const trees = (b.plots||[]).reduce((s,p)=>s+(Number(p.treeCount)||0),0);
+  const open = (b.healthIssues||[]).filter(h=>h.status==='open');
+  return { plots:(b.plots||[]).length, trees,
+           urgent: open.some(h=>h.severity==='urgent'), watch: open.length>0 };
+}
+
+function openGardenForm(existing){
+  const isEdit = !!existing;
+  const sheet = document.getElementById('sheetGeneric');
+  sheet.innerHTML = `
+    <div class="sheet-handle"></div>
+    <div class="sheet-head"><h3>${isEdit?'แก้ไขสวน':'เพิ่มสวนใหม่'}</h3><button class="icon-btn" id="sgClose">${ICONS.close}</button></div>
+    <div class="field"><label>ชื่อสวน</label><input type="text" id="gfName" value="${existing?escapeHtml(existing.name||''):''}" placeholder="เช่น สวนบ้าน, สวนริมคลอง"></div>
+    <div class="row2">
+      <div class="field"><label>พื้นที่</label><input type="number" id="gfArea" value="${existing?escapeHtml(existing.area||''):''}"></div>
+      <div class="field"><label>หน่วย</label><select id="gfUnit">
+        <option ${existing&&existing.areaUnit==='ไร่'?'selected':''}>ไร่</option>
+        <option ${existing&&existing.areaUnit==='งาน'?'selected':''}>งาน</option>
+        <option ${existing&&existing.areaUnit==='เฮกตาร์'?'selected':''}>เฮกตาร์</option>
+      </select></div>
+    </div>
+    <div class="field"><label>ปีที่เริ่มทำสวน (พ.ศ.)</label><input type="number" id="gfYear" value="${existing?escapeHtml(existing.startYear||''):''}"></div>
+    <button class="btn btn-primary btn-block" id="gfSave">${isEdit?'บันทึกการแก้ไข':'เพิ่มสวน'}</button>
+    ${isEdit && STATE.gardens.length>1 ? `<button class="btn btn-danger btn-block" style="margin-top:8px" id="gfDelete">ลบสวนนี้</button>`:''}
+  `;
+  document.getElementById('sgClose').addEventListener('click', ()=>closeSheet('sheetGeneric'));
+  document.getElementById('gfSave').addEventListener('click', ()=>{
+    const name = document.getElementById('gfName').value.trim();
+    if(!name){ toast('กรุณาใส่ชื่อสวน'); return; }
+    const fields = { name,
+      area: document.getElementById('gfArea').value.trim(),
+      areaUnit: document.getElementById('gfUnit').value,
+      startYear: document.getElementById('gfYear').value.trim() };
+    if(isEdit){ touch(Object.assign(existing, fields)); saveState(); }
+    else { const g = createGarden(fields); saveState(); switchGarden(g.id); }
+    closeSheet('sheetGeneric');
+    toast(isEdit?'บันทึกแล้ว':'เพิ่มสวนแล้ว');
+    updateTopbar();
+    if(document.getElementById('gardenRoot').classList.contains('open')) showGardenPicker();
+    else refreshCurrentView();
+  });
+  const del = document.getElementById('gfDelete');
+  if(del) del.addEventListener('click', async ()=>{
+    const ok = await confirmDialog({ title:'ลบสวนนี้?',
+      message:'ข้อมูลทั้งหมดของสวนนี้ (แปลง บันทึก การเก็บเกี่ยว) จะถูกลบไปด้วย' ,
+      confirmText:'ลบสวน' });
+    if(!ok) return;
+    tombstone('gardens', existing.id, existing.id);
+    STATE.gardens = STATE.gardens.filter(g=>g.id!==existing.id);
+    delete STATE.data[existing.id];
+    STATE.activeGardenId = STATE.gardens.length ? STATE.gardens[0].id : '';
+    bindActiveGarden(); saveState();
+    closeSheet('sheetGeneric'); toast('ลบสวนแล้ว');
+    updateTopbar();
+    showGardenPicker();
+  });
+  openSheet('sheetGeneric');
+}
+
+/* Whether the user has already settled on a garden since the app opened.
+   Without this the chooser would either never appear (a device that restores
+   its session doesn't run the sign-in path) or reappear on every sync. */
+let gardenChosen = false;
+
+/* Ask which garden to open, but only when there is a real choice to make and
+   nothing more important is on screen. */
+function maybeAskGarden(){
+  if(gardenChosen) return;
+  if((STATE.gardens||[]).length <= 1){ gardenChosen = true; return; }
+  const busy = ['wizardRoot','authRoot','modalMap'].some(id=>{
+    const el = document.getElementById(id);
+    return el && el.classList.contains('open');
+  });
+  if(busy) return;
+  showGardenPicker();
+}
+
+/* Garden chooser — shown when the account holds more than one garden. */
+function showGardenPicker(){
+  const root = document.getElementById('gardenRoot');
+  if(!root) return;
+  root.innerHTML = `
+    <div class="picker-wrap">
+      <div class="picker-head">
+        <div>
+          <div class="muted">${STATE.user.name?('สวัสดีคุณ'+escapeHtml(STATE.user.name)):'สวัสดี'} 👋</div>
+          <h2 class="picker-title">เลือกสวนที่จะดู</h2>
+        </div>
+        ${STATE.gardens.length ? `<button class="icon-btn ghost" id="gpClose">${ICONS.close}</button>` : ''}
+      </div>
+      <div class="list" id="gpList">
+        ${STATE.gardens.map(g=>{
+          const st = gardenStats(g.id);
+          const badge = st.urgent ? '<span class="badge badge-urgent">ต้องดูแลด่วน</span>'
+                     : (st.watch ? '<span class="badge badge-watch">เฝ้าระวัง</span>'
+                     : '<span class="badge badge-ok">ปกติ</span>');
+          return `<div class="row-card ${g.id===STATE.activeGardenId?'picker-active':''}" data-garden="${g.id}">
+            <div class="row-icon tint-blue" style="font-size:20px">🌳</div>
+            <div class="row-main">
+              <div class="row-title">${escapeHtml(g.name||'สวนไม่มีชื่อ')}</div>
+              <div class="row-sub">${st.plots} แปลง · ${st.trees} ต้น${g.area?(' · '+escapeHtml(g.area)+' '+escapeHtml(g.areaUnit||'')):''}</div>
+              <div style="margin-top:6px">${badge}</div>
+            </div>
+            <button class="icon-btn ghost" data-edit-garden="${g.id}">${ICONS.edit}</button>
+          </div>`;
+        }).join('') || `<div class="empty"><span class="emoji">🌱</span><div class="title">ยังไม่มีสวน</div><div class="desc">เพิ่มสวนแรกเพื่อเริ่มใช้งาน</div></div>`}
+      </div>
+      <button class="btn btn-soft btn-block" id="gpAdd" style="margin-top:14px">${ICONS.plus} เพิ่มสวนใหม่</button>
+    </div>
+  `;
+  root.classList.add('open');
+  root.querySelectorAll('[data-garden]').forEach(el=>el.addEventListener('click', (ev)=>{
+    if(ev.target.closest('[data-edit-garden]')) return;
+    hideGardenPicker();
+    switchGarden(el.getAttribute('data-garden'));
+  }));
+  root.querySelectorAll('[data-edit-garden]').forEach(b=>b.addEventListener('click', (ev)=>{
+    ev.stopPropagation();
+    const g = STATE.gardens.find(x=>x.id===b.getAttribute('data-edit-garden'));
+    if(g) openGardenForm(g);
+  }));
+  document.getElementById('gpAdd').addEventListener('click', ()=>openGardenForm(null));
+  const close = document.getElementById('gpClose');
+  if(close) close.addEventListener('click', ()=>hideGardenPicker());
+}
+function hideGardenPicker(){
+  gardenChosen = true;
+  const root = document.getElementById('gardenRoot');
+  if(root) root.classList.remove('open');
 }
 
 /* ============================== RENDER: PLOTS (registry) ============================== */
@@ -2146,6 +2380,8 @@ function renderSettings(){
     g.areaUnit = document.getElementById('stAreaUnit').value;
     g.startYear = document.getElementById('stStartYear').value.trim();
     touch(g);
+    const gRow = STATE.gardens.find(x=>x.id===STATE.activeGardenId);
+    if(gRow && gRow !== g) touch(Object.assign(gRow, g));
     u.name = document.getElementById('stUserName').value.trim();
     u.role = document.getElementById('stUserRole').value.trim();
     saveState(); toast('บันทึกข้อมูลสวนแล้ว');
@@ -2227,12 +2463,15 @@ function renderMenu(){
   root.innerHTML = `
     <h2 style="font-size:19px; margin-bottom:14px">เมนู</h2>
     <div class="list">
+      <div class="row-card" id="menuGardens"><div class="row-icon tint-blue" style="font-size:19px">🌳</div><div class="row-main"><div class="row-title">สวนของฉัน</div><div class="row-sub">${STATE.gardens.length} สวน · แตะเพื่อสลับหรือเพิ่มสวน</div></div><div class="row-end">${ICONS.arrowR}</div></div>
       <div class="row-card" data-go="buyers"><div class="row-icon tint-lavender" style="color:var(--lavender-deep)">${ICONS.buyers}</div><div class="row-main"><div class="row-title">ผู้รับซื้อ</div><div class="row-sub">${STATE.buyers.length} ราย</div></div><div class="row-end">${ICONS.arrowR}</div></div>
       <div class="row-card" data-go="weather"><div class="row-icon tint-peach" style="color:var(--peach-deep)">${ICONS.weather}</div><div class="row-main"><div class="row-title">สภาพอากาศ / สมาร์ทสวน</div><div class="row-sub">พยากรณ์อากาศประจำสวน</div></div><div class="row-end">${ICONS.arrowR}</div></div>
       <div class="row-card" data-go="settings"><div class="row-icon tint-pink" style="color:var(--pink-deep)">${ICONS.settings}</div><div class="row-main"><div class="row-title">ตั้งค่า</div><div class="row-sub">ข้อมูลสวน สำรองข้อมูล</div></div><div class="row-end">${ICONS.arrowR}</div></div>
     </div>
   `;
   root.querySelectorAll('[data-go]').forEach(el=>el.addEventListener('click', ()=>showView(el.getAttribute('data-go'))));
+  const mg = document.getElementById('menuGardens');
+  if(mg) mg.addEventListener('click', ()=>showGardenPicker());
 }
 
 /* ============================== WIZARD (first-run onboarding) ============================== */
@@ -2480,11 +2719,13 @@ function onWizardNext(){
 
 function finishWizard(){
   STATE.user = wizardData.user;
-  STATE.garden = touch(Object.assign(STATE.garden, wizardData.garden));
-  STATE.plots = wizardData.plots.map(p=>touch({ id:p.id, name:p.name, fruitType:p.fruitType, variety:'', treeCount:p.treeCount, plantingYear:p.plantingYear, notes:'' }));
-  STATE.products = wizardData.products.map(touch);
-  STATE.buyers = wizardData.buyers.map(touch);
-  STATE.garden.harvestSeasons = wizardData.harvestSeasons;
+  // the wizard sets up the account's first garden
+  const g0 = createGarden(Object.assign({}, wizardData.garden, { harvestSeasons: wizardData.harvestSeasons }));
+  STATE.activeGardenId = g0.id;
+  bindActiveGarden();
+  STATE.plots.push(...wizardData.plots.map(p=>touch({ id:p.id, name:p.name, fruitType:p.fruitType, variety:'', treeCount:p.treeCount, plantingYear:p.plantingYear, notes:'' })));
+  STATE.products.push(...wizardData.products.map(touch));
+  STATE.buyers.push(...wizardData.buyers.map(touch));
   // auto-create recurring tasks from frequencies
   const wf = Number(wizardData.garden.wateringFreqDays)||0;
   const ff = Number(wizardData.garden.fertilizingFreqDays)||0;
@@ -2538,6 +2779,7 @@ function enterApp(){
   document.getElementById('view-dashboard').style.display='';
   updateTopbar();
   showView('dashboard');
+  maybeAskGarden();
   setTimeout(checkReminders, 1500);
   setInterval(checkReminders, 10*60*1000);
 }
@@ -2589,6 +2831,38 @@ let syncTimer = null;
 let syncing = false;
 let syncStatus = 'offline'; // offline | ready | syncing | ok | error
 let syncMessage = '';
+
+function stateHasRealWork(s){
+  if(!s) return false;
+  if((s.gardens||[]).some(g=>(g.name||'').trim())) return true;
+  return Object.values(s.data||{}).some(b=>DATA_KEYS.some(k=>(b[k]||[]).length));
+}
+
+/* Select the signed-in account's own local cache before any network write.
+   An old, unbound sag_v1 save is adopted only once, preserving upgrades from
+   the pre-account version without allowing one known account to leak into
+   another. */
+function activateAccountState(accountId){
+  if(!accountId) return;
+  const currentId = STATE.cloud && STATE.cloud.accountId;
+  if(currentId === accountId) return;
+
+  if(currentId){
+    try{ localStorage.setItem(STORE_KEY + ':user:' + currentId, localStorage.getItem(STORE_KEY)||''); }catch(_e){}
+  }
+
+  const cached = localStorage.getItem(STORE_KEY + ':user:' + accountId);
+  if(cached){
+    localStorage.setItem(STORE_KEY, cached);
+    loadState();
+  } else if(currentId || !stateHasRealWork(STATE)) {
+    STATE = defaultState();
+    bindActiveGarden();
+  }
+  STATE.cloud.accountId = accountId;
+  STATE.cloud.lastPull = ''; // watermarks are never reusable across accounts
+  saveState();
+}
 
 /* Local array  <->  database table. Column names are the snake_case of the
    local field names, so one generic converter covers every table. */
@@ -2675,6 +2949,7 @@ async function initCloud(){
   try{
     const { data } = await sb.auth.getSession();
     sbSession = data ? data.session : null;
+    if(sbSession) activateAccountState(sbSession.user.id);
   }catch(e){ sbSession = null; }
 
   if(sb.auth.onAuthStateChange){
@@ -2692,13 +2967,25 @@ async function initCloud(){
 async function cloudSignIn(email, password){
   if(!sb) { const ok = await initCloud(); if(!ok) return {error:{message:'เชื่อมต่อไม่ได้'}}; }
   const res = await sb.auth.signInWithPassword({ email, password });
-  if(!res.error){ sbSession = res.data.session; await syncNow(); }
+  if(!res.error){ sbSession = res.data.session; activateAccountState(sbSession.user.id); await syncNow(); afterSignIn(); }
   return res;
+}
+
+/* Signing in can bring several gardens down with it; let the user pick which
+   one to open before dropping them on a dashboard for the wrong garden. */
+function afterSignIn(){
+  gardenChosen = false;          // a new account may bring a different set of gardens
+  if((STATE.gardens||[]).length > 1){
+    setTimeout(()=>maybeAskGarden(), 450);
+  } else {
+    updateTopbar();
+    refreshCurrentView();
+  }
 }
 async function cloudSignUp(email, password){
   if(!sb) { const ok = await initCloud(); if(!ok) return {error:{message:'เชื่อมต่อไม่ได้'}}; }
   const res = await sb.auth.signUp({ email, password });
-  if(!res.error && res.data.session){ sbSession = res.data.session; await syncNow(); }
+  if(!res.error && res.data.session){ sbSession = res.data.session; activateAccountState(sbSession.user.id); await syncNow(); afterSignIn(); }
   return res;
 }
 async function cloudSignOut(){
@@ -2708,51 +2995,114 @@ async function cloudSignOut(){
 }
 
 /* ---------- garden row ---------- */
-async function ensureGarden(){
+/* Every device on the same account must land on the same garden row.
+   Two things used to break that: once a device had stored a gardenId it never
+   looked again, and the lookup used limit(1) with no ordering, so two devices
+   could each pick a different row (or each create their own) and then diverge
+   forever. Now the account's gardens are ordered deterministically, the oldest
+   is treated as canonical, and any extras are folded into it. */
+/* Reconciles the account's garden list with the cloud. Every garden the
+   account can see is kept — an account may hold as many as it likes. */
+async function ensureGardens(){
   const uid_ = sbSession.user.id;
-  // already linked?
-  if(STATE.cloud.gardenId){
-    const { data } = await sb.from('gardens').select('id').eq('id', STATE.cloud.gardenId).maybeSingle();
-    if(data) return STATE.cloud.gardenId;
-  }
-  // any garden this user can see?
-  const { data: rows, error } = await sb.from('gardens').select('*').eq('deleted', false).limit(1);
+  const { data: rows, error } = await sb.from('gardens')
+    .select('*').eq('deleted', false).order('id', { ascending:true });
   if(error) throw error;
-  if(rows && rows.length){
-    STATE.cloud.gardenId = rows[0].id;
-    const g = rows[0];
-    // adopt cloud garden details if local is still blank
-    if(!STATE.garden.name && g.name){
-      STATE.garden = Object.assign(STATE.garden, {
-        name:g.name, lat:g.lat, lng:g.lng, area:g.area, areaUnit:g.area_unit,
-        startYear:g.start_year, harvestSeasons:g.harvest_seasons||{}, updated_at:g.updated_at
+  const cloudRows = rows || [];
+
+  // adopt anything this device hasn't seen before
+  cloudRows.forEach(r=>{
+    const local = STATE.gardens.find(g=>g.id===r.id);
+    if(!local){
+      STATE.gardens.push({
+        id:r.id, name:r.name||'', lat:r.lat, lng:r.lng, area:r.area||'',
+        areaUnit:r.area_unit||'ไร่', startYear:r.start_year||'',
+        harvestSeasons:r.harvest_seasons||{}, updated_at:r.updated_at, pushed:true
+      });
+      if(!STATE.data[r.id]) STATE.data[r.id] = emptyBucket();
+    } else if((r.updated_at||'') > (local.updated_at||'')){
+      // Cloud is newer: it wins even if this device still says dirty.  This
+      // prevents a stale/offline device from overwriting a newer edit.
+      delete local.dirty;
+      local.pushed = true;
+      Object.assign(local, {
+        name:r.name||'', lat:r.lat, lng:r.lng, area:r.area||'',
+        areaUnit:r.area_unit||'ไร่', startYear:r.start_year||'',
+        harvestSeasons:r.harvest_seasons||{}, updated_at:r.updated_at
       });
     }
-    saveState();
-    return STATE.cloud.gardenId;
-  }
-  // none yet — create one from local data and push everything up
-  const gid = uid();
-  const { error: insErr } = await sb.from('gardens').insert({
-    id: gid, owner_id: uid_,
-    name: STATE.garden.name || 'สวนของฉัน',
-    lat: STATE.garden.lat, lng: STATE.garden.lng,
-    area: STATE.garden.area || null, area_unit: STATE.garden.areaUnit || null,
-    start_year: STATE.garden.startYear || null,
-    harvest_seasons: STATE.garden.harvestSeasons || {},
-    deleted: false,
-    updated_at: new Date().toISOString()
   });
-  if(insErr) throw insErr;
-  STATE.cloud.gardenId = gid;
-  markAllDirty();
-  saveState();
-  return gid;
+
+  const knownRemotely = new Set(cloudRows.map(r=>r.id));
+  // A blank, unnamed garden that only exists because the app had to start
+  // somewhere isn't real work — don't upload it as a duplicate.
+  if(cloudRows.length){
+    STATE.gardens = STATE.gardens.filter(g=>{
+      if(knownRemotely.has(g.id)) return true;
+      const b = STATE.data[g.id] || emptyBucket();
+      const hasRows = DATA_KEYS.some(k=>(b[k]||[]).length);
+      const blank = !hasRows && !((g.name||'').trim());
+      if(blank) delete STATE.data[g.id];
+      return !blank;
+    });
+  }
+  cloudRows.forEach(r=>{ const l = STATE.gardens.find(g=>g.id===r.id); if(l) l.pushed = true; });
+  // A garden disappears locally only if we know it once existed remotely and
+  // is now gone. One that has never been pushed is this device's own work and
+  // must survive, dirty flag or not.
+  STATE.gardens = STATE.gardens.filter(g=>knownRemotely.has(g.id) || !g.pushed);
+
+  // push gardens this device created while offline
+  for(const g of STATE.gardens){
+    if(knownRemotely.has(g.id)) continue;
+    const { error: insErr } = await sb.from('gardens').insert({
+      id:g.id, owner_id:uid_, name:g.name||'สวนของฉัน', lat:g.lat, lng:g.lng,
+      area:g.area||null, area_unit:g.areaUnit||null, start_year:g.startYear||null,
+      harvest_seasons:g.harvestSeasons||{}, deleted:false,
+      updated_at:g.updated_at||new Date().toISOString()
+    });
+    if(insErr) throw insErr;
+    g.pushed = true; delete g.dirty;
+    markGardenDirty(g.id);   // its records need to go up too
+  }
+
+  // push edits to gardens that already exist remotely
+  for(const g of STATE.gardens){
+    if(!g.dirty || !knownRemotely.has(g.id)) continue;
+    const { error: upErr } = await sb.from('gardens').update({
+      name:g.name||'', lat:g.lat, lng:g.lng, area:g.area||null,
+      area_unit:g.areaUnit||null, start_year:g.startYear||null,
+      harvest_seasons:g.harvestSeasons||{},
+      updated_at:g.updated_at||new Date().toISOString()
+    }).eq('id', g.id);
+    if(upErr) throw upErr;
+    delete g.dirty;
+  }
+
+  // deleted gardens queued locally
+  const deadGardens = (STATE.tombstones||[]).filter(t=>t.table==='gardens' && t.dirty);
+  for(const t of deadGardens){
+    const { error: delErr } = await sb.from('gardens')
+      .update({ deleted:true, updated_at:t.updated_at }).eq('id', t.id);
+    if(delErr) throw delErr;
+    delete t.dirty;
+  }
+
+  if(!STATE.gardens.length) return null;
+  if(!STATE.activeGardenId || !STATE.gardens.some(g=>g.id===STATE.activeGardenId)){
+    STATE.activeGardenId = STATE.gardens[0].id;
+  }
+  bindActiveGarden();
+  return STATE.activeGardenId;
 }
 
-function markAllDirty(){
-  TABLE_SPECS.forEach(spec=>{ (STATE[spec.key]||[]).forEach(r=>{ r.dirty = true; if(!r.updated_at) r.updated_at = new Date().toISOString(); }); });
-  if(STATE.garden) STATE.garden.dirty = true;
+function markGardenDirty(gid){
+  const b = STATE.data[gid];
+  if(!b) return;
+  DATA_KEYS.forEach(k=>(b[k]||[]).forEach(r=>{
+    r.dirty = true;
+    if(!r.updated_at) r.updated_at = new Date().toISOString();
+  }));
 }
 
 /* ---------- sync ---------- */
@@ -2764,49 +3114,21 @@ function scheduleSync(){
 
 async function syncNow(){
   if(syncing) return;
-  if(!sb || !sbSession){ setSyncStatus(sb?'offline':'offline','ยังไม่ได้เข้าสู่ระบบ'); return; }
+  if(!sb || !sbSession){ setSyncStatus('offline','ยังไม่ได้เข้าสู่ระบบ'); return; }
   if(!navigator.onLine){ setSyncStatus('offline','ออฟไลน์ — จะซิงก์ให้เมื่อมีเน็ต'); return; }
   syncing = true; setSyncStatus('syncing');
   try{
-    const gardenId = await ensureGarden();
+    commitAliases();                       // work from the stored buckets
+    await ensureGardens();
+
     let watermark = STATE.cloud.lastPull || '1970-01-01T00:00:00.000Z';
     let newWatermark = watermark;
 
-    // 1) push the garden row itself
-    if(STATE.garden && STATE.garden.dirty){
-      const g = STATE.garden;
-      const { error } = await sb.from('gardens').update({
-        name:g.name||'', lat:g.lat, lng:g.lng, area:g.area||null, area_unit:g.areaUnit||null,
-        start_year:g.startYear||null, harvest_seasons:g.harvestSeasons||{},
-        updated_at:g.updated_at || new Date().toISOString()
-      }).eq('id', gardenId);
-      if(error) throw error;
-      delete STATE.garden.dirty;
-    }
-
-    // 2) push dirty rows, table by table
+    // 1) Pull first. A new or stale device must see the server version before
+    //    it is allowed to write. This is the key protection against blank or
+    //    old local data replacing good cloud data.
     for(const spec of TABLE_SPECS){
-      const dirty = (STATE[spec.key]||[]).filter(r=>r.dirty);
-      if(!dirty.length) continue;
-      const rows = dirty.map(r=>rowFromLocal(r, gardenId));
-      const { error } = await sb.from(spec.table).upsert(rows, { onConflict:'id' });
-      if(error) throw error;
-      dirty.forEach(r=>{ delete r.dirty; });
-    }
-
-    // 3) push deletions as tombstones
-    const deadRows = (STATE.tombstones||[]).filter(t=>t.dirty);
-    for(const t of deadRows){
-      const { error } = await sb.from(t.table)
-        .upsert([{ id:t.id, garden_id:gardenId, deleted:true, updated_at:t.updated_at }], { onConflict:'id' });
-      if(error) throw error;
-      delete t.dirty;
-    }
-
-    // 4) pull anything changed elsewhere since the last watermark
-    for(const spec of TABLE_SPECS){
-      const { data, error } = await sb.from(spec.table).select('*')
-        .eq('garden_id', gardenId).gt('updated_at', watermark);
+      const { data, error } = await sb.from(spec.table).select('*').gt('updated_at', watermark);
       if(error) throw error;
       (data||[]).forEach(row=>{
         if(row.updated_at > newWatermark) newWatermark = row.updated_at;
@@ -2814,23 +3136,56 @@ async function syncNow(){
       });
     }
 
-    // 5) pull garden row changes
-    const { data: gRow } = await sb.from('gardens').select('*').eq('id', gardenId).maybeSingle();
-    if(gRow && gRow.updated_at > (STATE.garden.updated_at||'') && !STATE.garden.dirty){
-      STATE.garden = Object.assign(STATE.garden, {
-        name:gRow.name, lat:gRow.lat, lng:gRow.lng, area:gRow.area, areaUnit:gRow.area_unit,
-        startYear:gRow.start_year, harvestSeasons:gRow.harvest_seasons||{}, updated_at:gRow.updated_at
-      });
-      if(gRow.updated_at > newWatermark) newWatermark = gRow.updated_at;
+    // 2) push dirty rows of every garden, not only the one on screen
+    for(const gid of Object.keys(STATE.data)){
+      if(!STATE.gardens.some(g=>g.id===gid)) continue;
+      const bucket = STATE.data[gid];
+      for(const spec of TABLE_SPECS){
+        const dirty = (bucket[spec.key]||[]).filter(r=>r.dirty);
+        if(!dirty.length) continue;
+        const rows = dirty.map(r=>rowFromLocal(r, gid));
+        const { error } = await sb.from(spec.table).upsert(rows, { onConflict:'id' });
+        if(error) throw error;
+        dirty.forEach(r=>{ delete r.dirty; });
+      }
     }
 
+    // 3) push deletions
+    const deadRows = (STATE.tombstones||[]).filter(t=>t.dirty && t.table!=='gardens');
+    for(const t of deadRows){
+      const { error } = await sb.from(t.table).upsert(
+        [{ id:t.id, garden_id: t.gardenId || STATE.activeGardenId, deleted:true, updated_at:t.updated_at }],
+        { onConflict:'id' });
+      if(error) throw error;
+      delete t.dirty;
+    }
+
+    bindActiveGarden();
     STATE.cloud.lastPull = newWatermark;
     STATE.cloud.lastSyncAt = new Date().toISOString();
-    // tombstones that have been pushed can be trimmed after a while
     STATE.tombstones = (STATE.tombstones||[]).filter(t=>t.dirty || (Date.now() - new Date(t.updated_at).getTime()) < 30*86400000);
-    localStorage.setItem(STORE_KEY, JSON.stringify(STATE));
+    saveState();
     setSyncStatus('ok');
+
+    /* A new device signing into an existing account already has its garden in
+       the cloud — sending it through the setup wizard would only create a
+       duplicate. If the wizard is still untouched, drop it and open the app. */
+    if(!STATE.meta.onboarded && STATE.gardens.length && (typeof wizardStep !== 'number' || wizardStep === 1)){
+      STATE.meta.onboarded = true;
+      saveState();
+      const wr = document.getElementById('wizardRoot');
+      if(wr) wr.classList.remove('open');
+      const dash = document.getElementById('view-dashboard');
+      if(dash) dash.style.display = '';
+      enterApp();
+      toast('ดึงข้อมูลสวนของบัญชีนี้มาแล้ว');
+      return;
+    }
+
     if(typeof refreshCurrentView === 'function') refreshCurrentView();
+    if(typeof updateTopbar === 'function') updateTopbar();
+    // a sync can be the first time this device learns there are several gardens
+    if(STATE.meta.onboarded && typeof maybeAskGarden === 'function') maybeAskGarden();
   }catch(e){
     console.warn('sync failed', e);
     setSyncStatus('error', (e && e.message) ? e.message : 'ซิงก์ไม่สำเร็จ');
@@ -2840,17 +3195,22 @@ async function syncNow(){
 }
 
 function mergeRemoteRow(spec, row){
-  const list = STATE[spec.key] = STATE[spec.key] || [];
+  const gid = row.garden_id;
+  if(!gid) return;
+  if(!STATE.gardens.some(g=>g.id===gid)) return;      // a garden this account can't see
+  if(!STATE.data[gid]) STATE.data[gid] = emptyBucket();
+  const list = STATE.data[gid][spec.key] = STATE.data[gid][spec.key] || [];
   const idx = list.findIndex(x=>x.id===row.id);
   const local = idx>=0 ? list[idx] : null;
 
-  // never let a pull clobber an edit that hasn't been pushed yet
-  if(local && local.dirty) return;
+  // Last-write-wins is decided before pushing. A newer cloud edit cancels a
+  // stale local dirty flag; a genuinely newer offline edit remains queued.
+  if(local && local.dirty && (local.updated_at||'') >= (row.updated_at||'')) return;
 
   if(row.deleted){
     if(idx>=0) list.splice(idx,1);
     const ts = (STATE.tombstones||[]).find(t=>t.table===spec.table && t.id===row.id);
-    if(!ts){ STATE.tombstones.push({ table:spec.table, id:row.id, updated_at:row.updated_at, dirty:false }); }
+    if(!ts){ STATE.tombstones.push({ table:spec.table, id:row.id, gardenId:gid, updated_at:row.updated_at, dirty:false }); }
     return;
   }
   const incoming = localFromRow(row);
@@ -2989,8 +3349,12 @@ function renderCloudSection(){
           <button class="btn btn-primary btn-block btn-sm" id="cfgSync">ซิงก์เดี๋ยวนี้</button>
           <button class="btn btn-ghost btn-block btn-sm" id="cfgOut">ออกจากระบบ</button>
         </div>
+        <button class="btn btn-soft btn-block btn-sm" id="cfgPullAll" style="margin-top:10px">ดึงข้อมูลจากคลาวด์ใหม่ทั้งหมด</button>
+        <p class="muted" style="margin-top:8px">ใช้เมื่อเครื่องนี้แสดงข้อมูลไม่ตรงกับอีกเครื่อง</p>
         <div class="divider"></div>
-        <label style="display:block;font-size:12.5px;color:var(--text-soft);margin-bottom:6px;font-weight:600">รหัสผู้ใช้ของฉัน (ใช้แชร์สวนให้คนอื่น)</label>
+        <label style="display:block;font-size:12.5px;color:var(--text-soft);margin-bottom:6px;font-weight:600">รหัสสวน (ต้องตรงกันทุกเครื่อง)</label>
+        <div class="num" style="font-size:11px; word-break:break-all; background:var(--surface-alt); padding:10px; border-radius:10px">${escapeHtml(c.gardenId||'ยังไม่ได้ซิงก์')}</div>
+        <label style="display:block;font-size:12.5px;color:var(--text-soft);margin:12px 0 6px;font-weight:600">รหัสผู้ใช้ของฉัน (ใช้แชร์สวนให้คนอื่น)</label>
         <div class="num" style="font-size:11px; word-break:break-all; background:var(--surface-alt); padding:10px; border-radius:10px">${escapeHtml(sbSession.user.id)}</div>
       ` : `
         <p class="muted" style="margin-bottom:12px">ยังไม่ได้เข้าสู่ระบบ — ข้อมูลถูกเก็บไว้ในเครื่องนี้เท่านั้น</p>
@@ -3001,6 +3365,18 @@ function renderCloudSection(){
 
   const $ = id=>document.getElementById(id);
   if($('cfgSync')) $('cfgSync').addEventListener('click', async ()=>{ toast('กำลังซิงก์...'); await syncNow(); });
+  if($('cfgPullAll')) $('cfgPullAll').addEventListener('click', async ()=>{
+    const ok = await confirmDialog({
+      title:'ดึงข้อมูลใหม่ทั้งหมด?',
+      message:'จะดึงข้อมูลทุกอย่างจากคลาวด์ลงมาอีกครั้ง สิ่งที่บันทึกไว้ในเครื่องนี้และยังไม่ได้ส่งขึ้นไป จะถูกส่งขึ้นไปด้วย ไม่มีอะไรหาย',
+      confirmText:'ดึงข้อมูล', danger:false });
+    if(!ok) return;
+    STATE.cloud.lastPull = '';   // forget the watermark so everything comes back down
+    saveState();
+    toast('กำลังดึงข้อมูล...');
+    await syncNow();
+    refreshCurrentView();
+  });
   if($('cfgOut')) $('cfgOut').addEventListener('click', async ()=>{ await cloudSignOut(); renderCloudSection(); });
   if($('cfgLogin')) $('cfgLogin').addEventListener('click', ()=>showAuthScreen());
 }
