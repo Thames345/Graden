@@ -663,3 +663,119 @@ textarea{ resize: vertical; min-height: 72px; }
 @keyframes shimmer{ 0%{background-position:100% 0;} 100%{background-position:0 0;} }
 
 ::-webkit-scrollbar{ width:0; height:0; }
+
+/* ===================== Multi-garden overview v3 ===================== */
+/* Keep the chooser below sheets so "เพิ่มสวน/แก้ไขสวน" can open on top. */
+#gardenRoot{ z-index:89; }
+.picker-wrap{ padding-bottom:110px; }
+.picker-section-label{
+  margin:18px 2px 9px; font-size:12px; font-weight:700; color:var(--text-soft);
+}
+.picker-all-card{
+  padding:16px; margin-bottom:8px; cursor:pointer;
+  border:1.5px solid rgba(47,107,255,.16);
+}
+.picker-all-card:active{ transform:scale(.99); }
+.picker-all-head,.garden-fin-head{
+  display:flex; align-items:center; gap:12px;
+}
+.picker-fin-grid,.garden-fin-grid{
+  display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; margin-top:13px;
+}
+.picker-fin-grid>div,.garden-fin-grid>div{
+  min-width:0; padding:9px 7px; border-radius:12px; background:var(--surface-alt);
+}
+.picker-fin-grid span,.garden-fin-grid span,.lifetime-card span{
+  display:block; font-size:10.5px; color:var(--text-faint); margin-bottom:3px;
+}
+.picker-fin-grid b,.garden-fin-grid b,.lifetime-card b{
+  display:block; font-family:var(--font-mono); font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.picker-money{ margin-top:5px; color:var(--blue-deep); }
+.neg{ color:var(--pink-deep)!important; }
+
+.all-garden-hero{
+  display:flex; align-items:center; justify-content:space-between; gap:14px;
+  padding:19px 18px; margin-bottom:16px; border-radius:var(--r-xl);
+  color:#fff; background:linear-gradient(135deg,var(--blue-soft),var(--blue-deep));
+  box-shadow:var(--shadow-blue);
+}
+.all-garden-title{ font-size:21px; font-weight:800; margin:3px 0; }
+.all-garden-sub{ font-size:12px; opacity:.86; }
+.btn-white{ background:#fff; color:var(--blue-deep); box-shadow:none; flex:none; }
+.mini-kpi-grid{
+  display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-top:10px;
+}
+.mini-kpi{ padding:12px 10px; min-width:0; }
+.mini-kpi .label{ font-size:10.5px; color:var(--text-faint); margin-bottom:5px; }
+.mini-kpi b{ font-family:var(--font-mono); font-size:14px; }
+.all-garden-list{ display:flex; flex-direction:column; gap:10px; }
+.garden-fin-card{ padding:15px; cursor:pointer; }
+.garden-fin-card:active{ transform:scale(.99); }
+.lifetime-card{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:9px; padding:15px; }
+.lifetime-card>div{ min-width:0; }
+.lifetime-card b{ font-size:14px; }
+
+@media (max-width:390px){
+  .picker-fin-grid,.garden-fin-grid,.lifetime-card{ gap:5px; }
+  .picker-fin-grid b,.garden-fin-grid b,.lifetime-card b{ font-size:12px; }
+  .picker-fin-grid span,.garden-fin-grid span,.lifetime-card span{ font-size:9.5px; }
+  .all-garden-hero{ align-items:flex-start; }
+  .all-garden-title{ font-size:19px; }
+  .mini-kpi-grid{ grid-template-columns:1fr; }
+}
+
+/* ===================== Smart product dosage calculator ===================== */
+.pack-details{
+  margin:10px 0 12px; border:1.5px solid var(--border); border-radius:var(--r-md);
+  background:var(--surface-alt); overflow:hidden;
+}
+.pack-details summary{
+  list-style:none; cursor:pointer; padding:11px 12px; display:flex; align-items:center;
+  justify-content:space-between; gap:10px; font-size:12px; font-weight:700; color:var(--text-soft);
+}
+.pack-details summary::-webkit-details-marker{ display:none; }
+.pack-details summary:after{ content:'⌄'; font-size:15px; color:var(--text-faint); transition:transform .18s ease; }
+.pack-details[open] summary:after{ transform:rotate(180deg); }
+.pack-details summary b{ margin-left:auto; font-size:11.5px; color:var(--blue-deep); font-weight:600; }
+.pack-body{ padding:2px 12px 12px; border-top:1px solid var(--border); }
+.pack-body .field{ margin-top:10px; }
+.usage-box{
+  background:linear-gradient(150deg, var(--blue-tint), rgba(255,255,255,.72));
+  border:1px solid rgba(47,107,255,.12); border-radius:var(--r-md); padding:12px; margin-top:10px;
+}
+.usage-title{ font-size:12.5px; font-weight:800; color:var(--blue-deep); margin-bottom:9px; }
+.dose-quicks{ display:flex; flex-wrap:wrap; gap:6px; margin-top:-2px; }
+.dose-quick{
+  border:none; background:var(--surface); color:var(--blue-deep); border-radius:var(--r-pill);
+  padding:6px 10px; font-size:11.5px; font-weight:700; cursor:pointer; box-shadow:var(--shadow-soft);
+}
+.usage-result{
+  margin-top:10px; border-radius:var(--r-md); border:1px solid var(--border); overflow:hidden; background:var(--surface);
+}
+.usage-result>div:not(.ir-calc-warn){
+  display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 11px;
+  font-size:11.5px; color:var(--text-soft); border-bottom:1px solid var(--border);
+}
+.usage-result>div:last-of-type{ border-bottom:none; }
+.usage-result b{ font-family:var(--font-mono); color:var(--text); font-size:12.5px; }
+.usage-result .usage-cost{ background:var(--blue-tint); color:var(--blue-deep); font-weight:700; }
+.usage-result .usage-cost b{ color:var(--blue-deep); font-size:15px; }
+.ir-calc-warn{ display:none; padding:8px 11px; font-size:10.5px; line-height:1.45; color:var(--peach-deep); background:var(--peach-tint); }
+.product-pack-card{
+  background:var(--surface-alt); border:1.5px solid var(--border); border-radius:var(--r-md); padding:14px; margin:4px 0 16px;
+}
+.product-pack-title{ font-size:13px; font-weight:800; color:var(--text); margin-bottom:4px; }
+.input-prefix{ position:relative; display:flex; align-items:center; }
+.input-prefix>span{ position:absolute; left:14px; z-index:2; color:var(--text-soft); font-weight:700; }
+.input-prefix input{ padding-left:31px; }
+.mini-row .mr-text{ display:flex; flex-direction:column; gap:2px; min-width:0; }
+.mini-row .mr-text b{ font-size:13.5px; font-weight:700; color:var(--text); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.mini-row .mr-text small{ font-size:10.5px; color:var(--text-faint); font-weight:500; }
+.combo-meta-cost{ margin-left:8px; color:var(--text-faint); font-size:10.5px; font-weight:500; }
+
+@media(max-width:380px){
+  .pack-details summary{ align-items:flex-start; flex-wrap:wrap; }
+  .pack-details summary b{ width:100%; margin-left:0; }
+  .dose-quick{ flex:1 1 20%; }
+}
