@@ -31,7 +31,7 @@ function defaultState(){
     activeGardenId:'',
     data:{},               // gardenId -> bucket of that garden's records
     settings:{ notifEnabled:false, lastNotifDate:null },
-    weatherCache:null,     // {fetchedAt, current:{}, daily:{}}
+    weatherCache:{},       // gardenId -> {fetchedAt, current:{}, daily:{}}
     tombstones:[],         // {table,id,gardenId,updated_at,dirty} — deletes waiting to sync
     cloud:{ lastPull:'', lastSyncAt:'' }
   };
@@ -85,7 +85,7 @@ function loadState(){
     base.user = Object.assign(base.user, parsed.user||{});
     base.settings = Object.assign(base.settings, parsed.settings||{});
     base.cloud = Object.assign(base.cloud, parsed.cloud||{});
-    base.weatherCache = parsed.weatherCache || null;
+    base.weatherCache = {};
     base.tombstones = Array.isArray(parsed.tombstones)? parsed.tombstones : [];
 
     let migrated = false;
@@ -96,6 +96,16 @@ function loadState(){
     } else {
       migrateSingleGarden(parsed, base);
       migrated = true;
+    }
+    // v1/v2 used one weather cache for the entire account.  Multi-garden
+    // accounts need a cache per garden, otherwise switching locations can
+    // briefly show the previous garden's forecast.
+    if(parsed.weatherCache && parsed.weatherCache.fetchedAt){
+      const cacheGid = base.activeGardenId || (base.gardens[0] && base.gardens[0].id) || '';
+      if(cacheGid) base.weatherCache[cacheGid] = parsed.weatherCache;
+      migrated = true;
+    } else if(parsed.weatherCache && typeof parsed.weatherCache === 'object'){
+      base.weatherCache = parsed.weatherCache;
     }
     STATE = base;
     bindActiveGarden();
@@ -157,7 +167,14 @@ function tombstone(table, id, gardenId){
 const THAI_MONTHS = ["ม.ค.","ก.พ.","มี.ค.","เม.ย.","พ.ค.","มิ.ย.","ก.ค.","ส.ค.","ก.ย.","ต.ค.","พ.ย.","ธ.ค."];
 const THAI_DOW = ["อา","จ","อ","พ","พฤ","ศ","ส"];
 
-function todayISO(){ return new Date().toISOString().slice(0,10); }
+function localISODate(date){
+  const d = date instanceof Date ? date : new Date(date);
+  const y = d.getFullYear();
+  const m = String(d.getMonth()+1).padStart(2,'0');
+  const day = String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${day}`;
+}
+function todayISO(){ return localISODate(new Date()); }
 function fmtDate(iso){
   if(!iso) return "-";
   const d = new Date(iso+"T00:00:00");
@@ -401,13 +418,95 @@ const CARE_CATS = [
   { key:'pesticide',  label:'ยา',    product:'spray',     color:'#8B5CF6' },
   { key:'other',      label:'อื่นๆ', product:'other',     color:'#7A8AA8' }
 ];
+
+/* Product package metadata is packed into products.type so the current
+   Supabase schema stays compatible (type is text). Old values such as
+   "fertilize" still work. New values look like:
+   fertilize::{"packageQty":1,"packageUnit":"L","packagePrice":500}
+   This lets package size/price sync across devices without a DB migration. */
+const UNIT_DEFS = {
+  cc:     { label:'cc',    family:'volume', factor:1 },
+  ml:     { label:'ml',    family:'volume', factor:1 },
+  L:      { label:'ลิตร',  family:'volume', factor:1000 },
+  g:      { label:'กรัม',  family:'mass',   factor:1 },
+  kg:     { label:'กก.',   family:'mass',   factor:1000 },
+  bottle: { label:'ขวด',   family:'bottle', factor:1 },
+  bag:    { label:'ถุง',   family:'bag',    factor:1 }
+};
+const UNIT_ORDER = ['cc','ml','L','g','kg','bottle','bag'];
+function unitLabel(u){ return (UNIT_DEFS[u]||{}).label || u || ''; }
+function unitOptionsHtml(selected){
+  return UNIT_ORDER.map(u=>`<option value="${u}" ${u===selected?'selected':''}>${UNIT_DEFS[u].label}</option>`).join('');
+}
+function productTypeBase(raw){ return String(raw||'other').split('::')[0] || 'other'; }
+function productPackMeta(productOrType){
+  const raw = typeof productOrType==='string' ? productOrType : ((productOrType&&productOrType.type)||'');
+  const pos = raw.indexOf('::');
+  if(pos<0) return { packageQty:'', packageUnit:'', packagePrice:'' };
+  try{
+    const m = JSON.parse(raw.slice(pos+2));
+    return {
+      packageQty: m.packageQty==null?'':m.packageQty,
+      packageUnit: m.packageUnit||'',
+      packagePrice: m.packagePrice==null?'':m.packagePrice
+    };
+  }catch(_e){ return { packageQty:'', packageUnit:'', packagePrice:'' }; }
+}
+function composeProductType(base, meta){
+  base = productTypeBase(base);
+  const q = Number(meta&&meta.packageQty)||0;
+  const u = meta&&meta.packageUnit || '';
+  const pr = Number(meta&&meta.packagePrice)||0;
+  if(!q || !u || !pr) return base;
+  return base + '::' + JSON.stringify({ packageQty:q, packageUnit:u, packagePrice:pr });
+}
+function productByName(name){ return STATE.products.find(x=>x.name===name); }
+function suggestedUseUnit(packUnit){
+  if(packUnit==='L' || packUnit==='ml' || packUnit==='cc') return 'cc';
+  if(packUnit==='kg' || packUnit==='g') return 'g';
+  return packUnit || 'cc';
+}
+function toBaseAmount(qty, unit){
+  const d = UNIT_DEFS[unit];
+  if(!d) return null;
+  return { family:d.family, value:(Number(qty)||0)*d.factor };
+}
+function calcPackageUseCost(doseQty, doseUnit, tankCount, packageQty, packageUnit, packagePrice){
+  const use = toBaseAmount((Number(doseQty)||0) * Math.max(1, Number(tankCount)||1), doseUnit);
+  const pack = toBaseAmount(packageQty, packageUnit);
+  const price = Number(packagePrice)||0;
+  if(!use || !pack || !price || !pack.value || use.family!==pack.family){
+    return { cost:0, fraction:0, totalUsed:(Number(doseQty)||0)*Math.max(1, Number(tankCount)||1), compatible:false };
+  }
+  const fraction = use.value / pack.value;
+  return { cost:fraction*price, fraction, totalUsed:(Number(doseQty)||0)*Math.max(1, Number(tankCount)||1), compatible:true };
+}
+function careItemCost(it){
+  if(it && it.lineCost!=null && it.lineCost!=='') return Number(it.lineCost)||0;
+  return (Number(it&&it.qty)||0) * (Number(it&&it.unitCost)||0);
+}
+function careItemUsageText(it){
+  if(!it) return '';
+  if(it.doseQty!=null && it.doseQty!==''){
+    const total = (Number(it.doseQty)||0) * Math.max(1, Number(it.tankCount)||1);
+    return total ? `${fmtNum(total)} ${unitLabel(it.doseUnit||'')}` : '';
+  }
+  if(Number(it.qty)) return `${fmtNum(it.qty)} หน่วย`;
+  return '';
+}
+function productPackSummary(p){
+  const m = productPackMeta(p);
+  if(!Number(m.packageQty) || !m.packageUnit || !Number(m.packagePrice)) return 'ยังไม่ได้ตั้งขนาด/ราคา';
+  return `${fmtNum(m.packageQty)} ${unitLabel(m.packageUnit)} · ฿${fmtMoney(m.packagePrice)}`;
+}
 function catTagHtml(key){
   const c = catByKey(key);
   return `<span class="cat-tag cat-${c.key}">${c.label}</span>`;
 }
 function catByKey(k){ return CARE_CATS.find(c=>c.key===k) || CARE_CATS[2]; }
 function catFromProductType(t){
-  const c = CARE_CATS.find(x=>x.product===t);
+  const base = productTypeBase(t);
+  const c = CARE_CATS.find(x=>x.product===base);
   return c ? c.key : 'other';
 }
 /* The category is a property of the product, set once in Settings — so the
@@ -469,7 +568,7 @@ function categoryCostTotals(matchFn){
   STATE.careEvents.filter(e=>matchFn(e.date)).forEach(e=>{
     let itemsSum = 0;
     careItemsOf(e).forEach(it=>{
-      const cost = (Number(it.qty)||0) * (Number(it.unitCost)||0);
+      const cost = careItemCost(it);
       t[itemCategoryOf(it, e)] += cost;
       itemsSum += cost;
     });
@@ -487,30 +586,47 @@ function categoryCostTotals(matchFn){
 /* ============================== ROUTER ============================== */
 const VIEWS = ['dashboard','plots','calendar','analysis','menu','plotDetail','buyers','weather','settings'];
 let currentView = 'dashboard';
+// 'garden' = one selected garden, 'all' = account-wide financial overview.
+// The activeGardenId remains untouched in all-mode so switching back is instant.
+let gardenViewMode = 'garden';
 
 function updateTopbar(){
   const nameEl = document.getElementById('gardenNameTop');
   const metaEl = document.getElementById('gardenMetaTop');
   const brand = document.querySelector('.topbar .brand');
-  const many = (STATE.gardens || []).length > 1;
-  if(nameEl) nameEl.textContent = (STATE.garden.name || 'สวนอัจฉริยะ') + (many ? '  ⌄' : '');
-  if(metaEl){
-    const plots = STATE.plots.length;
-    const trees = STATE.plots.reduce((s,p)=>s+(Number(p.treeCount)||0),0);
-    metaEl.textContent = plots ? `${plots} แปลง · ${trees} ต้น` : '';
+  if(gardenViewMode==='all'){
+    const plots = (STATE.gardens||[]).reduce((n,g)=>n+((STATE.data[g.id]&&STATE.data[g.id].plots)||[]).length,0);
+    const trees = (STATE.gardens||[]).reduce((n,g)=>n+((STATE.data[g.id]&&STATE.data[g.id].plots)||[]).reduce((s,p)=>s+(Number(p.treeCount)||0),0),0);
+    if(nameEl) nameEl.textContent = 'ภาพรวมทุกสวน  ⌄';
+    if(metaEl) metaEl.textContent = `${STATE.gardens.length} สวน · ${plots} แปลง · ${trees} ต้น`;
+  } else {
+    // Always expose the garden chooser.  The name doubles as the switcher.
+    if(nameEl) nameEl.textContent = (STATE.garden.name || 'สวนอัจฉริยะ') + '  ⌄';
+    if(metaEl){
+      const plots = STATE.plots.length;
+      const trees = STATE.plots.reduce((s,p)=>s+(Number(p.treeCount)||0),0);
+      metaEl.textContent = plots ? `${plots} แปลง · ${trees} ต้น` : '';
+    }
   }
   if(brand){
     // with several gardens the name doubles as the switcher
-    brand.classList.toggle('switchable', many);
+    brand.classList.add('switchable');
     if(!brand.dataset.wired){
       brand.dataset.wired = '1';
-      brand.addEventListener('click', ()=>{ if((STATE.gardens||[]).length > 1) showGardenPicker(); });
+      brand.addEventListener('click', ()=>showGardenPicker());
     }
   }
 }
 
 function showView(name, opts){
   opts = opts || {};
+  // Account-wide mode is intentionally a summary.  Operational screens belong
+  // to one physical location, so ask which garden to work in before opening them.
+  if(gardenViewMode==='all' && !['dashboard','menu'].includes(name)){
+    toast('เลือกสวนก่อนเพื่อดูข้อมูลหน้านี้');
+    showGardenPicker(false);
+    return;
+  }
   document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
   const el = document.getElementById('view-'+name);
   if(el) el.classList.add('active');
@@ -533,13 +649,53 @@ function careCostOf(ev){ return Number(ev.totalCost)||0; }
 function harvestRevenueOf(h){ return (Number(h.weightKg)||0) * (Number(h.pricePerKg)||0); }
 function harvestCostOf(h){ return (Number(h.laborCost)||0) + (Number(h.fuelCost)||0); }
 
-function monthStats(mk){
-  const careCost = STATE.careEvents.filter(e=>monthKey(e.date)===mk).reduce((s,e)=>s+careCostOf(e),0);
-  const hInMonth = STATE.harvests.filter(h=>monthKey(h.date)===mk);
+function monthStatsForBucket(bucket, mk){
+  bucket = bucket || emptyBucket();
+  const care = bucket.careEvents || [];
+  const harvests = bucket.harvests || [];
+  const careCost = care.filter(e=>e.date && monthKey(e.date)===mk).reduce((s,e)=>s+careCostOf(e),0);
+  const hInMonth = harvests.filter(h=>h.date && monthKey(h.date)===mk);
   const harvestCost = hInMonth.reduce((s,h)=>s+harvestCostOf(h),0);
   const revenue = hInMonth.reduce((s,h)=>s+harvestRevenueOf(h),0);
   const totalCost = careCost + harvestCost;
-  return { careCost, harvestCost, totalCost, revenue, profit: revenue-totalCost };
+  const weightKg = hInMonth.reduce((s,h)=>s+(Number(h.weightKg)||0),0);
+  return { careCost, harvestCost, totalCost, revenue, profit: revenue-totalCost, weightKg };
+}
+function monthStats(mk){
+  return monthStatsForBucket({ careEvents:STATE.careEvents, harvests:STATE.harvests }, mk);
+}
+function aggregateMonthStats(mk){
+  return (STATE.gardens||[]).reduce((sum,g)=>{
+    const st = monthStatsForBucket(STATE.data[g.id] || emptyBucket(), mk);
+    sum.careCost += st.careCost;
+    sum.harvestCost += st.harvestCost;
+    sum.totalCost += st.totalCost;
+    sum.revenue += st.revenue;
+    sum.profit += st.profit;
+    sum.weightKg += st.weightKg;
+    return sum;
+  }, {careCost:0, harvestCost:0, totalCost:0, revenue:0, profit:0, weightKg:0});
+}
+function allTimeStatsForBucket(bucket){
+  bucket = bucket || emptyBucket();
+  const care = bucket.careEvents || [];
+  const harvests = bucket.harvests || [];
+  const careCost = care.reduce((s,e)=>s+careCostOf(e),0);
+  const harvestCost = harvests.reduce((s,h)=>s+harvestCostOf(h),0);
+  const revenue = harvests.reduce((s,h)=>s+harvestRevenueOf(h),0);
+  const weightKg = harvests.reduce((s,h)=>s+(Number(h.weightKg)||0),0);
+  const totalCost = careCost + harvestCost;
+  return {careCost, harvestCost, totalCost, revenue, profit:revenue-totalCost, weightKg};
+}
+function aggregateAllTimeStats(){
+  return (STATE.gardens||[]).reduce((sum,g)=>{
+    const st = allTimeStatsForBucket(STATE.data[g.id] || emptyBucket());
+    sum.totalCost += st.totalCost;
+    sum.revenue += st.revenue;
+    sum.profit += st.profit;
+    sum.weightKg += st.weightKg;
+    return sum;
+  }, {totalCost:0, revenue:0, profit:0, weightKg:0});
 }
 
 function yearStats(y){
@@ -612,7 +768,7 @@ function last6Months(){
 function upcomingTasks(days){
   const today = todayISO();
   const limit = new Date(); limit.setDate(limit.getDate()+days);
-  const limitISO = limit.toISOString().slice(0,10);
+  const limitISO = localISODate(limit);
   return STATE.tasks.filter(t=>!t.done && t.dueDate <= limitISO).sort((a,b)=>a.dueDate<b.dueDate?-1:1);
 }
 function overdueTasks(){
@@ -678,6 +834,7 @@ function donutChart(container, data, opts){
 
 /* ============================== RENDER: DASHBOARD ============================== */
 function renderDashboard(){
+  if(gardenViewMode==='all'){ renderAllGardensDashboard(); return; }
   const root = document.getElementById('view-dashboard');
   const overdue = overdueTasks(), dueToday = dueTodayTasks();
   const openHealth = STATE.healthIssues.filter(h=>h.status==='open');
@@ -752,6 +909,16 @@ function renderDashboard(){
       <h2 style="font-size:19px;margin-top:2px">${periodLabel}</h2>
     </div>
 
+    <div class="row-card" id="dashGardenSwitch" style="margin-bottom:14px">
+      <div class="row-icon tint-blue" style="font-size:20px">🌳</div>
+      <div class="row-main">
+        <div class="row-sub">สวนที่กำลังดู</div>
+        <div class="row-title">${escapeHtml(STATE.garden.name||'สวนของฉัน')}</div>
+        <div class="row-sub">${STATE.plots.length} แปลง · ${STATE.plots.reduce((s,p)=>s+(Number(p.treeCount)||0),0)} ต้น${STATE.garden.area?(' · '+escapeHtml(STATE.garden.area)+' '+escapeHtml(STATE.garden.areaUnit||'')):''}</div>
+      </div>
+      <button class="btn btn-soft btn-sm" id="dashAddGarden" type="button">+ สวนใหม่</button>
+    </div>
+
     <div class="hero">
       <div class="h-left">
         <div class="h-eyebrow">แผนงานวันนี้</div>
@@ -803,6 +970,17 @@ function renderDashboard(){
 
   wireRecordRows(root);   // กิจกรรมล่าสุด rows open the record they came from
 
+  const gardenSwitch = document.getElementById('dashGardenSwitch');
+  if(gardenSwitch) gardenSwitch.addEventListener('click', (ev)=>{
+    if(ev.target.closest('#dashAddGarden')) return;
+    showGardenPicker();
+  });
+  const addGardenBtn = document.getElementById('dashAddGarden');
+  if(addGardenBtn) addGardenBtn.addEventListener('click', (ev)=>{
+    ev.stopPropagation();
+    openGardenForm(null);
+  });
+
   // plot preview
   const prev = document.getElementById('dashPlotPreview');
   const plotsShow = STATE.plots.slice(0,4);
@@ -827,6 +1005,115 @@ function renderDashboard(){
   root.querySelectorAll('[data-go]').forEach(el=>el.addEventListener('click', ()=>showView(el.getAttribute('data-go'))));
 }
 
+function renderAllGardensDashboard(){
+  const root = document.getElementById('view-dashboard');
+  const mk = thisMonthKey();
+  const ms = aggregateMonthStats(mk);
+  const life = aggregateAllTimeStats();
+  const gardens = STATE.gardens || [];
+  const totalPlots = gardens.reduce((n,g)=>n+((STATE.data[g.id]&&STATE.data[g.id].plots)||[]).length,0);
+  const totalTrees = gardens.reduce((n,g)=>n+((STATE.data[g.id]&&STATE.data[g.id].plots)||[]).reduce((s,p)=>s+(Number(p.treeCount)||0),0),0);
+  const pendingTasks = gardens.reduce((n,g)=>n+((STATE.data[g.id]&&STATE.data[g.id].tasks)||[]).filter(t=>!t.done && t.dueDate && t.dueDate<=todayISO()).length,0);
+  const urgentIssues = gardens.reduce((n,g)=>n+((STATE.data[g.id]&&STATE.data[g.id].healthIssues)||[]).filter(h=>h.status==='open' && h.severity==='urgent').length,0);
+  const nowD = new Date();
+  const periodLabel = `${THAI_MONTHS[nowD.getMonth()]} ${nowD.getFullYear()+543}`;
+
+  root.innerHTML = `
+    <div class="flex-between" style="margin-bottom:14px;align-items:flex-start">
+      <div>
+        <div class="muted">ภาพรวมบัญชี</div>
+        <h2 style="font-size:20px;margin-top:2px">ทุกสวน · ${periodLabel}</h2>
+      </div>
+      <button class="btn btn-soft btn-sm" id="allAddGarden">+ สวนใหม่</button>
+    </div>
+
+    <div class="all-garden-hero">
+      <div>
+        <div class="h-eyebrow">พื้นที่ทั้งหมดที่กำลังดูแล</div>
+        <div class="all-garden-title">${gardens.length} สวน · ${totalPlots} แปลง</div>
+        <div class="all-garden-sub">${fmtNum(totalTrees)} ต้น${ms.weightKg?` · เก็บเกี่ยวเดือนนี้ ${fmtNum(ms.weightKg)} กก.`:''}</div>
+      </div>
+      <button class="btn btn-white btn-sm" id="allChangeGarden">เลือกสวน</button>
+    </div>
+
+    <div class="section-title"><h2>การเงินรวมเดือนนี้</h2></div>
+    <div class="bento">
+      <div class="card stat-card tint-blue">
+        <div class="label">ต้นทุนรวม</div>
+        <div class="value mono num">฿${fmtMoney(ms.totalCost)}</div>
+      </div>
+      <div class="card stat-card tint-peach">
+        <div class="label">รายได้รวม</div>
+        <div class="value mono num">฿${fmtMoney(ms.revenue)}</div>
+      </div>
+      <div class="card stat-card span2 ${ms.profit>=0?'tint-lavender':'tint-pink'}">
+        <div class="label">กำไรรวม</div>
+        <div class="value mono num">${ms.profit>=0?'':'-'}฿${fmtMoney(Math.abs(ms.profit))}</div>
+      </div>
+    </div>
+
+    <div class="mini-kpi-grid">
+      <div class="card mini-kpi"><div class="label">เก็บเกี่ยวเดือนนี้</div><b>${fmtNum(ms.weightKg)} กก.</b></div>
+      <div class="card mini-kpi"><div class="label">งานค้างรวม</div><b>${fmtNum(pendingTasks)} งาน</b></div>
+      <div class="card mini-kpi"><div class="label">ปัญหาเร่งด่วน</div><b>${fmtNum(urgentIssues)} รายการ</b></div>
+    </div>
+
+    <div class="section-title"><h2>แยกตามสวน</h2><span class="link" id="allPickGarden">เลือกสวน</span></div>
+    <div class="list all-garden-list">
+      ${gardens.map(g=>{
+        const b = STATE.data[g.id] || emptyBucket();
+        const st = monthStatsForBucket(b, mk);
+        const plots = (b.plots||[]).length;
+        const trees = (b.plots||[]).reduce((n,p)=>n+(Number(p.treeCount)||0),0);
+        return `<div class="card garden-fin-card" data-enter-garden="${g.id}">
+          <div class="garden-fin-head">
+            <div class="row-icon tint-blue" style="font-size:20px">🌳</div>
+            <div class="row-main">
+              <div class="row-title">${escapeHtml(g.name||'สวนไม่มีชื่อ')}</div>
+              <div class="row-sub">${plots} แปลง · ${fmtNum(trees)} ต้น${g.area?` · ${escapeHtml(g.area)} ${escapeHtml(g.areaUnit||'')}`:''}${g.lat!=null?' · 📍 มีตำแหน่ง':''}</div>
+            </div>
+            <span class="link">เข้าสวน</span>
+          </div>
+          <div class="garden-fin-grid">
+            <div><span>ต้นทุน</span><b>฿${fmtMoney(st.totalCost)}</b></div>
+            <div><span>รายได้</span><b>฿${fmtMoney(st.revenue)}</b></div>
+            <div><span>กำไร</span><b class="${st.profit<0?'neg':''}">${st.profit<0?'-':''}฿${fmtMoney(Math.abs(st.profit))}</b></div>
+          </div>
+        </div>`;
+      }).join('') || `<div class="empty"><span class="emoji">🌱</span><div class="title">ยังไม่มีสวน</div><div class="desc">เพิ่มสวนแรกเพื่อเริ่มบันทึกข้อมูล</div></div>`}
+    </div>
+
+    <div class="section-title"><h2>ยอดสะสมทุกสวน</h2></div>
+    <div class="card lifetime-card">
+      <div><span>รายได้สะสม</span><b>฿${fmtMoney(life.revenue)}</b></div>
+      <div><span>ต้นทุนสะสม</span><b>฿${fmtMoney(life.totalCost)}</b></div>
+      <div><span>กำไรสะสม</span><b class="${life.profit<0?'neg':''}">${life.profit<0?'-':''}฿${fmtMoney(Math.abs(life.profit))}</b></div>
+    </div>
+
+    <div class="section-title"><h2>แนวโน้มรวม 6 เดือน</h2></div>
+    <div class="card" id="allTrendChart"></div>
+    <div class="chart-legend" style="padding:0 4px">
+      <span><span class="dot" style="background:var(--blue)"></span>ต้นทุนรวม</span>
+      <span><span class="dot" style="background:var(--peach)"></span>รายได้รวม</span>
+    </div>
+  `;
+
+  const months = last6Months();
+  const chartData = months.map(mkk=>{
+    const st = aggregateMonthStats(mkk);
+    const d = new Date(mkk+'-01T00:00:00');
+    return {label:THAI_MONTHS[d.getMonth()], value:Math.round(st.totalCost), value2:Math.round(st.revenue)};
+  });
+  barChart(document.getElementById('allTrendChart'), chartData, {h:150, colorA:'var(--blue)', colorB:'var(--peach)'});
+
+  root.querySelectorAll('[data-enter-garden]').forEach(el=>el.addEventListener('click', ()=>{
+    switchGarden(el.getAttribute('data-enter-garden'));
+  }));
+  document.getElementById('allAddGarden').addEventListener('click', ()=>openGardenForm(null));
+  document.getElementById('allChangeGarden').addEventListener('click', ()=>showGardenPicker(false));
+  document.getElementById('allPickGarden').addEventListener('click', ()=>showGardenPicker(false));
+}
+
 function plotCardHtml(p){
   const status = plotHealthStatus(p.id);
   const ringCls = status==='urgent'?'plot-ring-urgent':(status==='watch'?'plot-ring-watch':'plot-ring-ok');
@@ -848,6 +1135,7 @@ function createGarden(fields){
 }
 function switchGarden(id){
   if(!STATE.gardens.some(g=>g.id===id)) return;
+  gardenViewMode = 'garden';
   gardenChosen = true;             // an explicit choice; stop asking this session
   commitAliases();                 // keep the garden we are leaving intact
   STATE.activeGardenId = id;
@@ -860,12 +1148,15 @@ function gardenStats(gid){
   const b = STATE.data[gid] || emptyBucket();
   const trees = (b.plots||[]).reduce((s,p)=>s+(Number(p.treeCount)||0),0);
   const open = (b.healthIssues||[]).filter(h=>h.status==='open');
-  return { plots:(b.plots||[]).length, trees,
+  const finance = monthStatsForBucket(b, thisMonthKey());
+  return { plots:(b.plots||[]).length, trees, finance,
            urgent: open.some(h=>h.severity==='urgent'), watch: open.length>0 };
 }
 
 function openGardenForm(existing){
   const isEdit = !!existing;
+  let selectedLat = existing && existing.lat != null ? Number(existing.lat) : null;
+  let selectedLng = existing && existing.lng != null ? Number(existing.lng) : null;
   const sheet = document.getElementById('sheetGeneric');
   sheet.innerHTML = `
     <div class="sheet-handle"></div>
@@ -880,23 +1171,44 @@ function openGardenForm(existing){
       </select></div>
     </div>
     <div class="field"><label>ปีที่เริ่มทำสวน (พ.ศ.)</label><input type="number" id="gfYear" value="${existing?escapeHtml(existing.startYear||''):''}"></div>
+    <div class="field">
+      <label>ตำแหน่งสวน</label>
+      <button class="btn btn-ghost btn-block" id="gfPickLocation" type="button">${ICONS.pin} ${selectedLat!=null?`พิกัด ${selectedLat.toFixed(4)}, ${selectedLng.toFixed(4)}`:'ปักหมุดตำแหน่งสวน'}</button>
+      <div class="muted" style="margin-top:6px">แต่ละสวนใช้พิกัดของตัวเองสำหรับสภาพอากาศและข้อมูลพื้นที่</div>
+    </div>
     <button class="btn btn-primary btn-block" id="gfSave">${isEdit?'บันทึกการแก้ไข':'เพิ่มสวน'}</button>
     ${isEdit && STATE.gardens.length>1 ? `<button class="btn btn-danger btn-block" style="margin-top:8px" id="gfDelete">ลบสวนนี้</button>`:''}
   `;
   document.getElementById('sgClose').addEventListener('click', ()=>closeSheet('sheetGeneric'));
+  document.getElementById('gfPickLocation').addEventListener('click', ()=>{
+    openMapPicker(selectedLat, selectedLng, (lat,lng)=>{
+      selectedLat = Number(lat); selectedLng = Number(lng);
+      const btn = document.getElementById('gfPickLocation');
+      if(btn) btn.innerHTML = `${ICONS.pin} พิกัด ${selectedLat.toFixed(4)}, ${selectedLng.toFixed(4)}`;
+    });
+  });
   document.getElementById('gfSave').addEventListener('click', ()=>{
     const name = document.getElementById('gfName').value.trim();
     if(!name){ toast('กรุณาใส่ชื่อสวน'); return; }
     const fields = { name,
       area: document.getElementById('gfArea').value.trim(),
       areaUnit: document.getElementById('gfUnit').value,
-      startYear: document.getElementById('gfYear').value.trim() };
-    if(isEdit){ touch(Object.assign(existing, fields)); saveState(); }
-    else { const g = createGarden(fields); saveState(); switchGarden(g.id); }
+      startYear: document.getElementById('gfYear').value.trim(),
+      lat: selectedLat,
+      lng: selectedLng };
+    if(isEdit){
+      touch(Object.assign(existing, fields)); saveState();
+    } else {
+      const g = createGarden(fields); saveState();
+      // If creation started from the full-screen chooser, enter the new garden
+      // immediately instead of leaving its chooser covering the dashboard.
+      if(document.getElementById('gardenRoot').classList.contains('open')) hideGardenPicker();
+      switchGarden(g.id);
+    }
     closeSheet('sheetGeneric');
     toast(isEdit?'บันทึกแล้ว':'เพิ่มสวนแล้ว');
     updateTopbar();
-    if(document.getElementById('gardenRoot').classList.contains('open')) showGardenPicker();
+    if(isEdit && document.getElementById('gardenRoot').classList.contains('open')) showGardenPicker(gardenPickerMandatory);
     else refreshCurrentView();
   });
   const del = document.getElementById('gfDelete');
@@ -918,50 +1230,83 @@ function openGardenForm(existing){
 }
 
 /* Whether the user has already settled on a garden since the app opened.
-   Without this the chooser would either never appear (a device that restores
-   its session doesn't run the sign-in path) or reappear on every sync. */
+   The product now deliberately opens on the garden chooser every session, even
+   when there is only one garden, so adding garden #2 never feels hidden. */
 let gardenChosen = false;
+let gardenPickerMandatory = false;
 
-/* Ask which garden to open, but only when there is a real choice to make and
-   nothing more important is on screen. */
 function maybeAskGarden(){
   if(gardenChosen) return;
-  if((STATE.gardens||[]).length <= 1){ gardenChosen = true; return; }
+  if(!(STATE.gardens||[]).length) return;
   const busy = ['wizardRoot','authRoot','modalMap'].some(id=>{
     const el = document.getElementById(id);
     return el && el.classList.contains('open');
   });
   if(busy) return;
-  showGardenPicker();
+  showGardenPicker(true);
 }
 
-/* Garden chooser — shown when the account holds more than one garden. */
-function showGardenPicker(){
+function showAllGardensOverview(){
+  gardenViewMode = 'all';
+  gardenChosen = true;
+  hideGardenPicker();
+  updateTopbar();
+  showView('dashboard');
+}
+
+/* Full-screen garden chooser. mandatory=true is used immediately after app
+   launch/login; the user must choose one garden or the all-gardens overview. */
+function showGardenPicker(mandatory){
+  gardenPickerMandatory = !!mandatory;
   const root = document.getElementById('gardenRoot');
   if(!root) return;
+  const mk = thisMonthKey();
+  const all = aggregateMonthStats(mk);
+  const totalPlots = (STATE.gardens||[]).reduce((n,g)=>n+((STATE.data[g.id]&&STATE.data[g.id].plots)||[]).length,0);
+  const totalTrees = (STATE.gardens||[]).reduce((n,g)=>n+((STATE.data[g.id]&&STATE.data[g.id].plots)||[]).reduce((s,p)=>s+(Number(p.treeCount)||0),0),0);
   root.innerHTML = `
     <div class="picker-wrap">
       <div class="picker-head">
         <div>
           <div class="muted">${STATE.user.name?('สวัสดีคุณ'+escapeHtml(STATE.user.name)):'สวัสดี'} 👋</div>
-          <h2 class="picker-title">เลือกสวนที่จะดู</h2>
+          <h2 class="picker-title">เลือกสวนก่อนเริ่มใช้งาน</h2>
+          <div class="muted" style="margin-top:5px">แต่ละสวนแยกตำแหน่ง แปลง ต้นทุน รายได้ และงานออกจากกัน</div>
         </div>
-        ${STATE.gardens.length ? `<button class="icon-btn ghost" id="gpClose">${ICONS.close}</button>` : ''}
+        ${!gardenPickerMandatory && STATE.gardens.length ? `<button class="icon-btn ghost" id="gpClose">${ICONS.close}</button>` : ''}
       </div>
+
+      <div class="card picker-all-card" id="gpAll">
+        <div class="picker-all-head">
+          <div class="row-icon tint-lavender" style="font-size:20px">📊</div>
+          <div class="row-main">
+            <div class="row-title">ภาพรวมทุกสวน</div>
+            <div class="row-sub">${STATE.gardens.length} สวน · ${totalPlots} แปลง · ${fmtNum(totalTrees)} ต้น</div>
+          </div>
+          <span class="link">ดูรวม</span>
+        </div>
+        <div class="picker-fin-grid">
+          <div><span>ต้นทุนเดือนนี้</span><b>฿${fmtMoney(all.totalCost)}</b></div>
+          <div><span>รายได้เดือนนี้</span><b>฿${fmtMoney(all.revenue)}</b></div>
+          <div><span>กำไรรวม</span><b class="${all.profit<0?'neg':''}">${all.profit<0?'-':''}฿${fmtMoney(Math.abs(all.profit))}</b></div>
+        </div>
+      </div>
+
+      <div class="picker-section-label">เลือกสวนที่ต้องการจัดการ</div>
       <div class="list" id="gpList">
         ${STATE.gardens.map(g=>{
           const st = gardenStats(g.id);
           const badge = st.urgent ? '<span class="badge badge-urgent">ต้องดูแลด่วน</span>'
                      : (st.watch ? '<span class="badge badge-watch">เฝ้าระวัง</span>'
                      : '<span class="badge badge-ok">ปกติ</span>');
-          return `<div class="row-card ${g.id===STATE.activeGardenId?'picker-active':''}" data-garden="${g.id}">
+          return `<div class="row-card ${gardenViewMode==='garden'&&g.id===STATE.activeGardenId?'picker-active':''}" data-garden="${g.id}">
             <div class="row-icon tint-blue" style="font-size:20px">🌳</div>
             <div class="row-main">
               <div class="row-title">${escapeHtml(g.name||'สวนไม่มีชื่อ')}</div>
-              <div class="row-sub">${st.plots} แปลง · ${st.trees} ต้น${g.area?(' · '+escapeHtml(g.area)+' '+escapeHtml(g.areaUnit||'')):''}</div>
+              <div class="row-sub">${st.plots} แปลง · ${st.trees} ต้น${g.area?(' · '+escapeHtml(g.area)+' '+escapeHtml(g.areaUnit||'')):''}${g.lat!=null?' · 📍 มีตำแหน่ง':''}</div>
+              <div class="row-sub picker-money">รายได้ ฿${fmtMoney(st.finance.revenue)} · ต้นทุน ฿${fmtMoney(st.finance.totalCost)} · กำไร ${st.finance.profit<0?'-':''}฿${fmtMoney(Math.abs(st.finance.profit))}</div>
               <div style="margin-top:6px">${badge}</div>
             </div>
-            <button class="icon-btn ghost" data-edit-garden="${g.id}">${ICONS.edit}</button>
+            <button class="icon-btn ghost" data-edit-garden="${g.id}" aria-label="แก้ไขสวน">${ICONS.edit}</button>
           </div>`;
         }).join('') || `<div class="empty"><span class="emoji">🌱</span><div class="title">ยังไม่มีสวน</div><div class="desc">เพิ่มสวนแรกเพื่อเริ่มใช้งาน</div></div>`}
       </div>
@@ -969,6 +1314,7 @@ function showGardenPicker(){
     </div>
   `;
   root.classList.add('open');
+  document.getElementById('gpAll').addEventListener('click', showAllGardensOverview);
   root.querySelectorAll('[data-garden]').forEach(el=>el.addEventListener('click', (ev)=>{
     if(ev.target.closest('[data-edit-garden]')) return;
     hideGardenPicker();
@@ -985,6 +1331,7 @@ function showGardenPicker(){
 }
 function hideGardenPicker(){
   gardenChosen = true;
+  gardenPickerMandatory = false;
   const root = document.getElementById('gardenRoot');
   if(root) root.classList.remove('open');
 }
@@ -1174,8 +1521,8 @@ function careRowHtml(e){
   const items = careItemsOf(e).filter(i=>i.name);
   const tags = careCatTags(e);
   const sub = items.length>1
-    ? items.map(i=>i.name).join(', ')
-    : (items.length===1 && items[0].qty ? fmtNum(items[0].qty)+' ขวด' : '');
+    ? items.map(i=>`${i.name}${careItemUsageText(i)?' · '+careItemUsageText(i):''}`).join(', ')
+    : (items.length===1 ? careItemUsageText(items[0]) : '');
   return `<div class="row-card" data-edit-care="${e.id}"><div class="row-icon ${meta.cls}" style="color:${meta.color}">${meta.icon}</div>
     <div class="row-main"><div class="row-title">${meta.label}${items.length===1?(' · '+escapeHtml(items[0].name)):(items.length>1?(' · '+items.length+' รายการ'):'')}</div>
       ${tags?`<div class="tag-row" style="margin-top:5px">${tags}</div>`:''}
@@ -1195,21 +1542,51 @@ function harvestRowHtml(h){
    total is the sum of the lines plus any other cost. */
 function openCareForm(existing, presetPlotId){
   const isEdit = !!existing;
-  const plotId = existing? existing.plotId : presetPlotId;
-  const type = existing? existing.type : 'spray';
-  let items = existing
-    ? careItemsOf(existing).map(i=>({ name:i.name||'', qty:i.qty||'', unitCost:i.unitCost||'',
-        cat: itemCategoryOf(i, existing) }))
-    : [];
-  items.forEach(it=>{ if(it.name) it.cat = productCategory(it.name) || it.cat || 'other'; });
-  const defaultCat = ()=>{
-    const t = sheet.querySelector('#careType .chip.active');
-    const v = t ? t.getAttribute('data-t') : type;
-    return v==='fertilize' ? 'fertilizer' : (v==='spray' ? 'pesticide' : 'other');
-  };
-  if(!items.length) items = [{name:'', qty:'', unitCost:'', cat:'other'}];
-
+  const plotId = existing ? existing.plotId : presetPlotId;
+  const type = existing ? existing.type : 'spray';
   const sheet = document.getElementById('sheetGeneric');
+
+  function normalizedItem(src){
+    src = src || {};
+    const knownProduct = productByName(src.name||'');
+    const pm = productPackMeta(knownProduct);
+    let packageQty = src.packageQty!=null && src.packageQty!=='' ? src.packageQty : pm.packageQty;
+    let packageUnit = src.packageUnit || pm.packageUnit || '';
+    let packagePrice = src.packagePrice!=null && src.packagePrice!=='' ? src.packagePrice : (src.unitCost || pm.packagePrice || '');
+    let doseQty = src.doseQty!=null && src.doseQty!=='' ? src.doseQty : '';
+    let doseUnit = src.doseUnit || '';
+    let tankCount = src.tankCount!=null && src.tankCount!=='' ? src.tankCount : 1;
+
+    // Migrate old "qty packages × price/package" entries into the new model
+    // without changing their historical cost.
+    if(doseQty==='' && (Number(src.qty)||0)){
+      if(Number(packageQty) && packageUnit){
+        doseQty = (Number(src.qty)||0) * Number(packageQty);
+        doseUnit = packageUnit;
+      }else{
+        packageQty = 1;
+        packageUnit = itemCategoryOf(src, existing)==='fertilizer' ? 'bag' : 'bottle';
+        doseQty = Number(src.qty)||0;
+        doseUnit = packageUnit;
+      }
+    }
+    if(!doseUnit && packageUnit) doseUnit = suggestedUseUnit(packageUnit);
+    if(!doseUnit) doseUnit = 'cc';
+
+    const calc = calcPackageUseCost(doseQty, doseUnit, tankCount, packageQty, packageUnit, packagePrice);
+    return {
+      name:src.name||'',
+      cat:itemCategoryOf(src, existing) || 'other',
+      packageQty, packageUnit, packagePrice,
+      doseQty, doseUnit, tankCount,
+      lineCost: src.lineCost!=null && src.lineCost!=='' ? src.lineCost : (calc.compatible ? calc.cost : ((Number(src.qty)||0)*(Number(src.unitCost)||0)))
+    };
+  }
+
+  let items = existing ? careItemsOf(existing).map(normalizedItem) : [];
+  items.forEach(it=>{ if(it.name) it.cat = productCategory(it.name) || it.cat || 'other'; });
+  if(!items.length) items = [normalizedItem({cat:'other'})];
+
   sheet.innerHTML = `
     <div class="sheet-handle"></div>
     <div class="sheet-head"><h3>${isEdit?'แก้ไขบันทึกการดูแล':'บันทึกการดูแล'}</h3><button class="icon-btn" id="sgClose">${ICONS.close}</button></div>
@@ -1226,6 +1603,7 @@ function openCareForm(existing, presetPlotId){
 
     <div class="field">
       <label>ปุ๋ย/ยาที่ใช้รอบนี้</label>
+      <div class="hint" style="margin:-2px 0 10px">เลือกสินค้า → ใส่ปริมาณต่อถัง/ครั้ง → แอปคำนวณปริมาณรวมและต้นทุนให้อัตโนมัติ</div>
       <div id="cfItems"></div>
       <button class="btn btn-soft btn-block btn-sm" id="cfAddItem" type="button">${ICONS.plus} เพิ่มปุ๋ย/ยาอีกรายการ</button>
     </div>
@@ -1256,32 +1634,74 @@ function openCareForm(existing, presetPlotId){
   const otherEl = document.getElementById('cfOther');
   const totalEl = document.getElementById('cfTotalPreview');
 
+  function valuesFromRow(row){
+    return {
+      name: row.querySelector('.combo-input').value.trim(),
+      packageQty: row.querySelector('.ir-pack-qty').value,
+      packageUnit: row.querySelector('.ir-pack-unit').value,
+      packagePrice: row.querySelector('.ir-pack-price').value,
+      doseQty: row.querySelector('.ir-dose').value,
+      doseUnit: row.querySelector('.ir-dose-unit').value,
+      tankCount: row.querySelector('.ir-tanks').value || 1
+    };
+  }
+  function calcFromRow(row){
+    const v = valuesFromRow(row);
+    return calcPackageUseCost(v.doseQty, v.doseUnit, v.tankCount, v.packageQty, v.packageUnit, v.packagePrice);
+  }
   function readItemsFromDOM(){
     itemsWrap.querySelectorAll('.item-row').forEach((row,i)=>{
       if(!items[i]) return;
-      items[i].name = row.querySelector('.combo-input').value.trim();
-      items[i].qty = row.querySelector('.ir-qty').value;
-      items[i].unitCost = row.querySelector('.ir-unit').value;
-      const known = productCategory(items[i].name);
+      const v = valuesFromRow(row);
+      Object.assign(items[i], v);
+      const known = productCategory(v.name);
       if(known) items[i].cat = known;
+      items[i].lineCost = calcFromRow(row).cost;
     });
+  }
+  function refreshRow(row){
+    const v = valuesFromRow(row);
+    const calc = calcFromRow(row);
+    const allPack = Number(v.packageQty) && v.packageUnit && Number(v.packagePrice);
+    const useDef = UNIT_DEFS[v.doseUnit];
+    const packDef = UNIT_DEFS[v.packageUnit];
+    const mismatch = allPack && Number(v.doseQty) && useDef && packDef && useDef.family!==packDef.family;
+
+    const summary = row.querySelector('.ir-pack-summary');
+    if(summary){
+      summary.textContent = allPack
+        ? `${fmtNum(v.packageQty)} ${unitLabel(v.packageUnit)} · ฿${fmtMoney(v.packagePrice)}`
+        : 'กรอกครั้งเดียว แอปจะจำไว้';
+    }
+    const used = row.querySelector('.ir-used');
+    const frac = row.querySelector('.ir-fraction');
+    const line = row.querySelector('.ir-line');
+    const warn = row.querySelector('.ir-calc-warn');
+    if(used) used.textContent = Number(v.doseQty) ? `${fmtNum(calc.totalUsed)} ${unitLabel(v.doseUnit)}` : '-';
+    if(frac) frac.textContent = calc.compatible ? Number(calc.fraction||0).toLocaleString('th-TH',{maximumFractionDigits:3}) : '-';
+    if(line) line.textContent = '฿' + fmtMoney(calc.cost);
+    if(warn){
+      warn.textContent = mismatch ? 'หน่วยที่ใช้กับขนาดบรรจุคนละประเภท กรุณาเลือกหน่วยให้ตรงกัน' : (!allPack ? 'ตั้งขนาดบรรจุและราคา เพื่อให้ระบบคำนวณต้นทุน' : '');
+      warn.style.display = warn.textContent ? 'block' : 'none';
+    }
+    const quick = row.querySelector('.dose-quicks');
+    if(quick) quick.style.display = useDef && useDef.family==='volume' ? 'flex' : 'none';
   }
   function grandTotal(){
     let sum = 0;
-    itemsWrap.querySelectorAll('.item-row').forEach(row=>{
-      sum += (Number(row.querySelector('.ir-qty').value)||0) * (Number(row.querySelector('.ir-unit').value)||0);
-    });
+    itemsWrap.querySelectorAll('.item-row').forEach(row=>{ sum += calcFromRow(row).cost; });
     return sum + (Number(otherEl.value)||0);
   }
   function refreshTotals(){
-    itemsWrap.querySelectorAll('.item-row').forEach(row=>{
-      const line = (Number(row.querySelector('.ir-qty').value)||0) * (Number(row.querySelector('.ir-unit').value)||0);
-      row.querySelector('.ir-line b').textContent = '฿' + fmtMoney(line);
-    });
+    itemsWrap.querySelectorAll('.item-row').forEach(refreshRow);
     totalEl.textContent = '฿' + fmtMoney(grandTotal());
   }
+
   function renderItems(){
-    itemsWrap.innerHTML = items.map((it,i)=>`
+    itemsWrap.innerHTML = items.map((it,i)=>{
+      const pmReady = Number(it.packageQty) && it.packageUnit && Number(it.packagePrice);
+      const tanks = Number(it.tankCount)||1;
+      return `
       <div class="item-row cat-edge cat-${it.cat||'other'}" data-i="${i}">
         <div class="ir-head">
           <span class="ir-num">รายการที่ ${i+1}</span>
@@ -1291,42 +1711,94 @@ function openCareForm(existing, presetPlotId){
           </span>
         </div>
         <div class="field"><div class="ir-combo"></div></div>
-        <div class="row2">
-          <div class="field"><label>จำนวน (ขวด/ถุง)</label><input type="number" class="ir-qty" step="0.1" value="${it.qty}" placeholder="0"></div>
-          <div class="field"><label>ราคาต่อหน่วย</label><input type="number" class="ir-unit" value="${it.unitCost}" placeholder="0"></div>
+
+        <details class="pack-details" ${pmReady?'':'open'}>
+          <summary><span>ข้อมูลสินค้า / บรรจุภัณฑ์</span><b class="ir-pack-summary">${pmReady?`${fmtNum(it.packageQty)} ${unitLabel(it.packageUnit)} · ฿${fmtMoney(it.packagePrice)}`:'กรอกครั้งเดียว แอปจะจำไว้'}</b></summary>
+          <div class="pack-body">
+            <div class="row2">
+              <div class="field"><label>ขนาดบรรจุ</label><input type="number" class="ir-pack-qty" step="0.01" min="0" value="${it.packageQty||''}" placeholder="เช่น 1"></div>
+              <div class="field"><label>หน่วยบรรจุ</label><select class="ir-pack-unit"><option value="">เลือกหน่วย</option>${unitOptionsHtml(it.packageUnit)}</select></div>
+            </div>
+            <div class="field"><label>ราคาต่อบรรจุภัณฑ์</label><div class="input-prefix"><span>฿</span><input type="number" class="ir-pack-price" step="0.01" min="0" value="${it.packagePrice||''}" placeholder="เช่น 500"></div></div>
+          </div>
+        </details>
+
+        <div class="usage-box">
+          <div class="usage-title">ปริมาณที่ใช้</div>
+          <div class="row2">
+            <div class="field"><label>ต่อถัง / ต่อครั้ง</label><input type="number" class="ir-dose" step="0.01" min="0" value="${it.doseQty||''}" placeholder="เช่น 100"></div>
+            <div class="field"><label>หน่วย</label><select class="ir-dose-unit">${unitOptionsHtml(it.doseUnit||suggestedUseUnit(it.packageUnit))}</select></div>
+          </div>
+          <div class="dose-quicks">
+            ${[50,100,200,500].map(q=>`<button type="button" class="dose-quick" data-q="${q}">${q}</button>`).join('')}
+          </div>
+          <div class="field" style="margin-top:10px"><label>จำนวนถัง / จำนวนครั้ง</label><input type="number" class="ir-tanks" step="1" min="1" value="${tanks}"></div>
         </div>
-        <div class="line-total ir-line">รวมรายการนี้ <b>฿0</b></div>
-      </div>
-    `).join('');
+
+        <div class="usage-result">
+          <div><span>รวมใช้</span><b class="ir-used">-</b></div>
+          <div><span>คิดเป็นสัดส่วนบรรจุภัณฑ์</span><b class="ir-fraction">-</b></div>
+          <div class="usage-cost"><span>ต้นทุนรายการนี้</span><b class="ir-line">฿0</b></div>
+          <div class="ir-calc-warn"></div>
+        </div>
+      </div>`;
+    }).join('');
+
     itemsWrap.querySelectorAll('.item-row').forEach((row,i)=>{
-      // repaint the colour band + tag whenever the chosen product changes
       const setCat = (k)=>{
         items[i].cat = k;
         CARE_CATS.forEach(c=>row.classList.toggle('cat-'+c.key, c.key===k));
         row.querySelector('.ir-cat').innerHTML = catTagHtml(k);
       };
+      const applyProductMeta = (name)=>{
+        const p = productByName(name);
+        if(!p) return;
+        const m = productPackMeta(p);
+        if(Number(m.packageQty) && m.packageUnit && Number(m.packagePrice)){
+          row.querySelector('.ir-pack-qty').value = m.packageQty;
+          row.querySelector('.ir-pack-unit').value = m.packageUnit;
+          row.querySelector('.ir-pack-price').value = m.packagePrice;
+          const currentUse = row.querySelector('.ir-dose-unit').value;
+          const curDef = UNIT_DEFS[currentUse];
+          const packDef = UNIT_DEFS[m.packageUnit];
+          if(!curDef || !packDef || curDef.family!==packDef.family){
+            row.querySelector('.ir-dose-unit').value = suggestedUseUnit(m.packageUnit);
+          }
+          const det = row.querySelector('.pack-details'); if(det) det.open = false;
+        }
+        refreshTotals();
+      };
       mountCombo(row.querySelector('.ir-combo'), {
-        placeholder:'เช่น ปุ๋ยสูตร 15-15-15, ยาฆ่าแมลง...',
+        placeholder:'เลือกหรือพิมพ์ชื่อปุ๋ย/ยา...',
         value: items[i].name,
         getOptions: productOptions,
-        getOptionMeta: (name)=>{ const k = productCategory(name); return k ? catTagHtml(k) : ''; },
+        getOptionMeta: (name)=>{ const p=productByName(name); const k = productCategory(name); return `${k ? catTagHtml(k) : ''}<span class="combo-meta-cost">${p?escapeHtml(productPackSummary(p)):''}</span>`; },
         addOptions: CARE_CATS.map(c=>({key:c.key, label:c.label, tag:catTagHtml(c.key)})),
         onPick:(v, addCat)=>{
           if(!v) return;
-          // a name that isn't in Settings yet still needs a category, so the
-          // list offers to file it on the spot rather than blocking the entry
           if(addCat){
-            if(!STATE.products.some(p=>p.name===v)){
-              STATE.products.push(touch({ id:uid(), name:v, type: catByKey(addCat).product }));
-              saveState();
+            let p = productByName(v);
+            if(!p){
+              p = touch({ id:uid(), name:v, type:catByKey(addCat).product });
+              STATE.products.push(p); saveState();
             }
             setCat(addCat);
+            applyProductMeta(v);
+            const det = row.querySelector('.pack-details'); if(det && !Number(row.querySelector('.ir-pack-price').value)) det.open=true;
             return;
           }
           setCat(productCategory(v) || 'other');
+          applyProductMeta(v);
         }
       });
-      row.querySelectorAll('.ir-qty, .ir-unit').forEach(inp=>inp.addEventListener('input', refreshTotals));
+
+      row.querySelectorAll('.ir-pack-qty,.ir-pack-unit,.ir-pack-price,.ir-dose,.ir-dose-unit,.ir-tanks')
+        .forEach(inp=>inp.addEventListener('input', refreshTotals));
+      row.querySelectorAll('select').forEach(sel=>sel.addEventListener('change', refreshTotals));
+      row.querySelectorAll('.dose-quick').forEach(b=>b.addEventListener('click', ()=>{
+        row.querySelector('.ir-dose').value = b.getAttribute('data-q');
+        refreshTotals();
+      }));
       const rm = row.querySelector('[data-rm]');
       if(rm) rm.addEventListener('click', ()=>{
         readItemsFromDOM();
@@ -1340,7 +1812,7 @@ function openCareForm(existing, presetPlotId){
 
   document.getElementById('cfAddItem').addEventListener('click', ()=>{
     readItemsFromDOM();
-    items.push({name:'', qty:'', unitCost:'', cat:'other'});
+    items.push(normalizedItem({cat:'other'}));
     renderItems();
     const last = itemsWrap.lastElementChild;
     if(last && typeof last.scrollIntoView === 'function') last.scrollIntoView({block:'nearest', behavior:'smooth'});
@@ -1351,39 +1823,62 @@ function openCareForm(existing, presetPlotId){
   document.getElementById('cfSave').addEventListener('click', ()=>{
     if(!selectedPlot){ toast('กรุณาเลือกแปลง'); return; }
     readItemsFromDOM();
-    const cleanItems = items
-      .filter(it=>it.name || Number(it.qty) || Number(it.unitCost))
-      .map(it=>({ name: it.name, cat: it.cat || 'other',
-                  qty: Number(it.qty)||0, unitCost: Number(it.unitCost)||0 }));
-    // categories are owned by Settings; just make sure the product exists there
-    cleanItems.forEach(it=>{
-      if(!it.name) return;
-      if(!STATE.products.some(x=>x.name===it.name)){
-        STATE.products.push(touch({ id:uid(), name:it.name, type: catByKey(it.cat||'other').product }));
-      }
+    const cleanItems = items.filter(it=>it.name || Number(it.doseQty) || Number(it.packagePrice)).map(it=>{
+      const calc = calcPackageUseCost(it.doseQty, it.doseUnit, it.tankCount, it.packageQty, it.packageUnit, it.packagePrice);
+      const packagePrice = Number(it.packagePrice)||0;
+      const fraction = calc.compatible ? calc.fraction : 0;
+      return {
+        name:it.name,
+        cat:it.cat||'other',
+        packageQty:Number(it.packageQty)||0,
+        packageUnit:it.packageUnit||'',
+        packagePrice,
+        doseQty:Number(it.doseQty)||0,
+        doseUnit:it.doseUnit||'',
+        tankCount:Math.max(1, Number(it.tankCount)||1),
+        totalUsedQty:calc.totalUsed,
+        lineCost:calc.cost,
+        // legacy fields kept for older app versions / existing reports
+        qty:fraction,
+        unitCost:packagePrice
+      };
     });
+
+    for(const it of cleanItems){
+      if(!it.name) continue;
+      let p = productByName(it.name);
+      const base = catByKey(it.cat||'other').product;
+      const meta = { packageQty:it.packageQty, packageUnit:it.packageUnit, packagePrice:it.packagePrice };
+      if(!p){
+        p = touch({id:uid(), name:it.name, type:composeProductType(base, meta)});
+        STATE.products.push(p);
+      }else{
+        const newType = composeProductType(base, meta);
+        if(p.type!==newType){ p.type=newType; touch(p); }
+      }
+    }
+
     const otherCost = Number(otherEl.value)||0;
-    const total = cleanItems.reduce((s,it)=>s + it.qty*it.unitCost, 0) + otherCost;
+    const total = cleanItems.reduce((s,it)=>s+careItemCost(it),0) + otherCost;
     const data = {
-      date: document.getElementById('cfDate').value || todayISO(),
-      plotId: selectedPlot,
-      type: sheet.querySelector('#careType .chip.active').getAttribute('data-t'),
-      items: cleanItems,
-      otherCost: otherCost,
-      totalCost: total,
-      // kept so entries saved before multi-item support still read correctly
-      productName: cleanItems.length? cleanItems[0].name : '',
-      qtyBottles: cleanItems.length? cleanItems[0].qty : 0,
-      unitCost: cleanItems.length? cleanItems[0].unitCost : 0,
-      note: document.getElementById('cfNote').value.trim()
+      date:document.getElementById('cfDate').value || todayISO(),
+      plotId:selectedPlot,
+      type:sheet.querySelector('#careType .chip.active').getAttribute('data-t'),
+      items:cleanItems,
+      otherCost,
+      totalCost:total,
+      productName:cleanItems.length?cleanItems[0].name:'',
+      qtyBottles:cleanItems.length?cleanItems[0].qty:0,
+      unitCost:cleanItems.length?cleanItems[0].unitCost:0,
+      note:document.getElementById('cfNote').value.trim()
     };
-    if(isEdit){ touch(Object.assign(existing, data)); } else { STATE.careEvents.push(touch(Object.assign({id:uid()}, data))); }
-    saveState(); closeSheet('sheetGeneric'); toast('บันทึกแล้ว');
+    if(isEdit) touch(Object.assign(existing,data)); else STATE.careEvents.push(touch(Object.assign({id:uid()},data)));
+    saveState(); closeSheet('sheetGeneric'); toast('บันทึกแล้ว · คำนวณต้นทุนให้อัตโนมัติ');
     refreshCurrentView();
   });
   if(isEdit){
     document.getElementById('cfDelete').addEventListener('click', async ()=>{
-      const ok = await confirmDialog({ title:'ลบบันทึกการดูแลนี้?', message:'ค่าใช้จ่ายของรายการนี้จะถูกหักออกจากยอดรวมด้วย' });
+      const ok = await confirmDialog({title:'ลบบันทึกการดูแลนี้?', message:'ค่าใช้จ่ายของรายการนี้จะถูกหักออกจากยอดรวมด้วย'});
       if(!ok) return;
       STATE.careEvents = STATE.careEvents.filter(x=>x.id!==existing.id); tombstone('care_events', existing.id);
       saveState(); closeSheet('sheetGeneric'); toast('ลบแล้ว'); refreshCurrentView();
@@ -1583,7 +2078,7 @@ function renderCalendar(){
   let html = "";
   for(let i=-2;i<=18;i++){
     const d = new Date(); d.setDate(d.getDate()+i);
-    const iso = d.toISOString().slice(0,10);
+    const iso = localISODate(d);
     const hasTask = STATE.tasks.some(t=>t.dueDate===iso && !t.done);
     html += `<div class="cal-day ${iso===todayISO()?'today':''} ${iso===calSelectedDate?'sel':''}" data-date="${iso}">
       <div class="dow">${THAI_DOW[d.getDay()]}</div><div class="dnum">${d.getDate()}</div>${hasTask?'<div class="dot"></div>':'<div style="height:9px"></div>'}
@@ -1614,7 +2109,7 @@ function renderCalendar(){
     t.done = true; t.doneDate = todayISO(); touch(t);
     if(t.recurrenceDays){
       const next = new Date(t.dueDate+"T00:00:00"); next.setDate(next.getDate()+Number(t.recurrenceDays));
-      STATE.tasks.push(touch({ id:uid(), title:t.title, plotId:t.plotId, type:t.type, dueDate: next.toISOString().slice(0,10), recurrenceDays:t.recurrenceDays, done:false }));
+      STATE.tasks.push(touch({ id:uid(), title:t.title, plotId:t.plotId, type:t.type, dueDate: localISODate(next), recurrenceDays:t.recurrenceDays, done:false }));
     }
     saveState(); toast('ทำเครื่องหมายว่าเสร็จแล้ว'); renderCalendar();
   }));
@@ -2000,6 +2495,7 @@ function renderBuyers(){
 function openProductForm(existing, onDone){
   const sheet = document.getElementById('sheetGeneric');
   const curCat = catFromProductType(existing.type);
+  const meta = productPackMeta(existing);
   sheet.innerHTML = `
     <div class="sheet-handle"></div>
     <div class="sheet-head"><h3>แก้ไขปุ๋ย/ยา</h3><button class="icon-btn" id="sgClose">${ICONS.close}</button></div>
@@ -2008,6 +2504,15 @@ function openProductForm(existing, onDone){
       <div class="chip-group" id="prCat">
         ${CARE_CATS.map(c=>`<div class="chip ${c.key===curCat?'active':''}" data-cat="${c.key}">${c.label}</div>`).join('')}
       </div>
+    </div>
+    <div class="product-pack-card">
+      <div class="product-pack-title">ข้อมูลบรรจุภัณฑ์และราคา</div>
+      <div class="hint" style="margin-bottom:12px">กรอกครั้งเดียว เวลาใช้จริงใส่แค่ cc / ml / กรัม และจำนวนถัง ระบบจะคำนวณต้นทุนให้เอง</div>
+      <div class="row2">
+        <div class="field"><label>ขนาดบรรจุ</label><input type="number" id="prPackQty" step="0.01" min="0" value="${meta.packageQty||''}" placeholder="เช่น 1"></div>
+        <div class="field"><label>หน่วย</label><select id="prPackUnit"><option value="">เลือกหน่วย</option>${unitOptionsHtml(meta.packageUnit)}</select></div>
+      </div>
+      <div class="field" style="margin-bottom:0"><label>ราคาต่อบรรจุภัณฑ์</label><div class="input-prefix"><span>฿</span><input type="number" id="prPackPrice" step="0.01" min="0" value="${meta.packagePrice||''}" placeholder="เช่น 500"></div></div>
     </div>
     <button class="btn btn-primary btn-block" id="prSave">บันทึกการแก้ไข</button>
     <button class="btn btn-danger btn-block" style="margin-top:8px" id="prDelete">ลบรายการนี้</button>
@@ -2021,12 +2526,19 @@ function openProductForm(existing, onDone){
     const name = document.getElementById('prName').value.trim();
     if(!name){ toast('กรุณาใส่ชื่อ'); return; }
     const cat = sheet.querySelector('#prCat .chip.active').getAttribute('data-cat');
+    const packMeta = {
+      packageQty:document.getElementById('prPackQty').value,
+      packageUnit:document.getElementById('prPackUnit').value,
+      packagePrice:document.getElementById('prPackPrice').value
+    };
+    const anyPack = Number(packMeta.packageQty) || packMeta.packageUnit || Number(packMeta.packagePrice);
+    const completePack = Number(packMeta.packageQty) && packMeta.packageUnit && Number(packMeta.packagePrice);
+    if(anyPack && !completePack){ toast('กรอกขนาดบรรจุ หน่วย และราคาให้ครบ'); return; }
     const oldName = existing.name;
     existing.name = name;
-    existing.type = catByKey(cat).product;
+    existing.type = composeProductType(catByKey(cat).product, packMeta);
     touch(existing);
     if(oldName !== name){
-      // keep saved entries pointing at this product
       STATE.careEvents.forEach(ev=>{
         let changed = false;
         (ev.items||[]).forEach(it=>{ if(it.name===oldName){ it.name = name; changed = true; } });
@@ -2034,7 +2546,7 @@ function openProductForm(existing, onDone){
         if(changed) touch(ev);
       });
     }
-    saveState(); closeSheet('sheetGeneric'); toast('แก้ไขแล้ว');
+    saveState(); closeSheet('sheetGeneric'); toast('บันทึกข้อมูลสินค้าแล้ว');
     if(onDone) onDone(); else refreshCurrentView();
   });
   document.getElementById('prDelete').addEventListener('click', async ()=>{
@@ -2091,6 +2603,11 @@ const WMO_MAP = {
 };
 function wmoDesc(code){ return WMO_MAP[code] || ['ไม่ทราบสภาพอากาศ','🌡️']; }
 
+function weatherCacheForGarden(){
+  if(!STATE.weatherCache || typeof STATE.weatherCache !== 'object') STATE.weatherCache = {};
+  return STATE.weatherCache[STATE.activeGardenId] || null;
+}
+
 async function fetchWeather(){
   const {lat,lng} = STATE.garden;
   if(lat==null || lng==null) return null;
@@ -2098,9 +2615,10 @@ async function fetchWeather(){
   const res = await fetch(url);
   if(!res.ok) throw new Error('weather fetch failed');
   const data = await res.json();
-  STATE.weatherCache = { fetchedAt: Date.now(), current: data.current, daily: data.daily };
+  if(!STATE.weatherCache || typeof STATE.weatherCache !== 'object') STATE.weatherCache = {};
+  STATE.weatherCache[STATE.activeGardenId] = { fetchedAt: Date.now(), current: data.current, daily: data.daily };
   saveState();
-  return STATE.weatherCache;
+  return STATE.weatherCache[STATE.activeGardenId];
 }
 
 function renderWeather(){
@@ -2156,9 +2674,9 @@ function renderWeather(){
     `;
   }
 
-  paint(STATE.weatherCache);
+  paint(weatherCacheForGarden());
   fetchWeather().then(cache=>paint(cache)).catch(()=>{
-    if(!STATE.weatherCache) body.innerHTML = `<div class="empty"><span class="emoji">📡</span><div class="title">ดึงข้อมูลอากาศไม่สำเร็จ</div><div class="desc">ตรวจสอบการเชื่อมต่ออินเทอร์เน็ต แล้วลองใหม่</div></div>`;
+    if(!weatherCacheForGarden()) body.innerHTML = `<div class="empty"><span class="emoji">📡</span><div class="title">ดึงข้อมูลอากาศไม่สำเร็จ</div><div class="desc">ตรวจสอบการเชื่อมต่ออินเทอร์เน็ต แล้วลองใหม่</div></div>`;
     else toast('ไม่สามารถอัปเดตอากาศได้ — แสดงข้อมูลล่าสุดที่มี');
   });
   document.getElementById('wxRefresh').addEventListener('click', ()=>{ toast('กำลังอัปเดต...'); fetchWeather().then(paint).catch(()=>toast('อัปเดตไม่สำเร็จ')); });
@@ -2327,7 +2845,7 @@ function renderSettings(){
       return `<div class="prod-group">
         <div class="prod-head cat-${c.key}"><span class="cat-dot"></span>${c.label} <span class="cnt">${inCat.length}</span></div>
         ${inCat.map(p=>`<div class="mini-row cat-edge cat-${c.key}" data-edit-prod="${p.id}">
-          <span class="mr-text">${escapeHtml(p.name)}</span>
+          <span class="mr-text"><b>${escapeHtml(p.name)}</b><small>${escapeHtml(productPackSummary(p))}</small></span>
           <span>
             <button class="mini-move" data-move="${p.id}">ย้ายหมวด</button>
             <button class="mini-remove" data-rm="${p.id}">ลบ</button>
@@ -2350,7 +2868,8 @@ function renderSettings(){
       const prod = STATE.products.find(p=>p.id===b.getAttribute('data-move'));
       if(!prod) return;
       const i = CARE_CATS.findIndex(c=>c.key===catFromProductType(prod.type));
-      prod.type = CARE_CATS[(i+1)%CARE_CATS.length].product;
+      const pm = productPackMeta(prod);
+      prod.type = composeProductType(CARE_CATS[(i+1)%CARE_CATS.length].product, pm);
       touch(prod); saveState(); paintProducts();
     }));
   }
@@ -2359,13 +2878,17 @@ function renderSettings(){
   mountCombo(document.getElementById('stProductCombo'), {
     placeholder:'พิมพ์ชื่อปุ๋ย/ยา แล้วเลือกว่าเป็นอะไร',
     getOptions:()=>STATE.products.map(p=>p.name),
-    getOptionMeta:(name)=>{ const k = productCategory(name); return k ? catTagHtml(k) : ''; },
+    getOptionMeta:(name)=>{ const k = productCategory(name); const p=productByName(name); return `${k ? catTagHtml(k) : ''}<span class="combo-meta-cost">${p?escapeHtml(productPackSummary(p)):''}</span>`; },
     addOptions: CARE_CATS.map(c=>({key:c.key, label:c.label, tag:catTagHtml(c.key)})),
     onPick:(v, addCat)=>{
       if(!v || !addCat) return;
       if(!STATE.products.some(p=>p.name===v)){
-        STATE.products.push(touch({id:uid(), name:v, type: catByKey(addCat).product}));
+        const prod = touch({id:uid(), name:v, type:catByKey(addCat).product});
+        STATE.products.push(prod);
         saveState(); paintProducts();
+        document.getElementById('stProductCombo').querySelector('.combo-input').value='';
+        setTimeout(()=>openProductForm(prod, paintProducts), 80);
+        return;
       }
       document.getElementById('stProductCombo').querySelector('.combo-input').value='';
     }
@@ -2734,6 +3257,8 @@ function finishWizard(){
     if(ff>0) STATE.tasks.push(touch({ id:uid(), title:`ใส่ปุ๋ย · ${p.name}`, plotId:p.id, type:'fertilize', dueDate:todayISO(), recurrenceDays:ff, done:false }));
   });
   STATE.meta.onboarded = true;
+  gardenChosen = true; // the setup wizard itself already selected the first garden
+  gardenViewMode = 'garden';
   saveState();
   document.getElementById('wizardRoot').classList.remove('open');
   toast('ตั้งค่าเสร็จสิ้น ยินดีต้อนรับ! 🌳');
@@ -2759,9 +3284,12 @@ function checkReminders(){
   if(!window.Notification || Notification.permission!=='granted') return;
   const today = todayISO();
   if(STATE.settings.lastNotifDate===today) return;
-  const due = STATE.tasks.filter(t=>!t.done && t.dueDate<=today);
+  const due = (STATE.gardens||[]).flatMap(g=>{
+    const b = STATE.data[g.id] || emptyBucket();
+    return (b.tasks||[]).filter(t=>!t.done && t.dueDate<=today).map(t=>({task:t,garden:g}));
+  });
   if(due.length){
-    try{ new Notification('สวนอัจฉริยะ', { body: `วันนี้มีงานที่ต้องทำ ${due.length} รายการ` }); }catch(e){}
+    try{ new Notification('สวนอัจฉริยะ', { body: `วันนี้ทุกสวนมีงานที่ต้องทำ ${due.length} รายการ` }); }catch(e){}
     STATE.settings.lastNotifDate = today; saveState();
   }
 }
@@ -2771,7 +3299,14 @@ function wireChrome(){
   document.querySelectorAll('.nav-btn[data-view]').forEach(btn=>{
     btn.addEventListener('click', ()=>showView(btn.getAttribute('data-view')));
   });
-  document.getElementById('fabAdd').addEventListener('click', openQuickAdd);
+  document.getElementById('fabAdd').addEventListener('click', ()=>{
+    if(gardenViewMode==='all'){
+      toast('เลือกสวนก่อนเพื่อเพิ่มบันทึก');
+      showGardenPicker(false);
+      return;
+    }
+    openQuickAdd();
+  });
   document.getElementById('topMenuBtn').addEventListener('click', ()=>showView('menu'));
 }
 
@@ -2975,12 +3510,10 @@ async function cloudSignIn(email, password){
    one to open before dropping them on a dashboard for the wrong garden. */
 function afterSignIn(){
   gardenChosen = false;          // a new account may bring a different set of gardens
-  if((STATE.gardens||[]).length > 1){
-    setTimeout(()=>maybeAskGarden(), 450);
-  } else {
-    updateTopbar();
-    refreshCurrentView();
-  }
+  gardenViewMode = 'garden';
+  updateTopbar();
+  refreshCurrentView();
+  if((STATE.gardens||[]).length) setTimeout(()=>maybeAskGarden(), 450);
 }
 async function cloudSignUp(email, password){
   if(!sb) { const ok = await initCloud(); if(!ok) return {error:{message:'เชื่อมต่อไม่ได้'}}; }
